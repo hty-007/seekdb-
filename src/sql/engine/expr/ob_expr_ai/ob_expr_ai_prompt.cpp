@@ -64,7 +64,7 @@ int ObExprAIPrompt::calc_result_typeN(ObExprResType &type,
   }
 
   for (int64_t i = 1; i < param_num && OB_SUCC(ret); i++) {
-    if (ob_is_string_tc(types_stack[i].get_type())) {
+    if (ob_is_string_tc(types_stack[i].get_type()) || ob_is_text_tc(types_stack[i].get_type())) {
       types_stack[i].set_calc_type(ObVarcharType);
       types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
     } else if (ob_is_json(types_stack[i].get_type())) {
@@ -114,8 +114,11 @@ int ObExprAIPrompt::eval_ai_prompt(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
       ObJsonString *arg_json_str = NULL;
       if (OB_FAIL(tmp_allocator.eval_arg(arg, ctx, datum))) {
       } else if (ob_is_string_tc(arg->datum_meta_.type_)) {
-        arg_str = datum->get_string();
-        if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(tmp_allocator, arg_str, arg_json_str))) {
+        if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, tmp_allocator,
+                                                             *datum, arg->datum_meta_,
+                                                             arg->obj_meta_.has_lob_header(),
+                                                             arg_str))) {
+        } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(tmp_allocator, arg_str, arg_json_str))) {
         } else if (OB_FAIL(args_array->append(arg_json_str))) {
         }
       } else if (ob_is_json(arg->datum_meta_.type_)) {
