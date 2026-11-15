@@ -2209,8 +2209,13 @@ void ObServer::ObAiColumnWorkerTask::runTimerTask()
   int ret = OB_SUCCESS;
   if (!is_inited_) {
     ret = OB_NOT_INIT;
-  } else if (OB_FAIL(process_once())) {
-    LOG_WARN("failed to process the pending ai column tasks", K(ret));
+  } else if (__sync_lock_test_and_set(&busy_, true)) {
+    // another pass is still running
+  } else {
+    if (OB_FAIL(process_once())) {
+      LOG_WARN("failed to process the pending ai column tasks", K(ret));
+    }
+    __sync_lock_release(&busy_);
   }
 }
 
@@ -2334,10 +2339,70 @@ int parse_ai_column_expr(const ObString &comment, ObString &model_name, ObString
 
 } // namespace ai_column_worker_helper
 
+// the writes must be the first statements of a connection, otherwise they block
+int ObServer::ObAiColumnWorkerTask::flush_pending_tasks()
+{
+  int ret = OB_SUCCESS;
+  ObMySQLProxy *proxy = NULL;
+  if (OB_ISNULL(obs_) || OB_ISNULL(proxy = &obs_->get_mysql_proxy())) {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < task_queue_.count(); ++i) {
+    const AiTaskRow &task = task_queue_.at(i);
+    ObAIFuncExprInfo *info = NULL;
+    ObString result_str;
+    int call_ret = OB_SUCCESS;
+    share::ObAiModelEndpointInfo endpoint;
+    query::ObIAiEndpointResolver *resolver = share::server_service<query::ObIAiEndpointResolver>();
+    if (OB_ISNULL(resolver) || task.model_name_.empty()) {
+      call_ret = OB_ERR_UNEXPECTED;
+    } else if (OB_SUCCESS != (call_ret = ObAIFuncUtils::get_ai_func_info(
+                                  task_allocator_, task.model_name_, info))) {
+    } else if (OB_SUCCESS != (call_ret = resolver->resolve_by_model_name(
+                                  task.model_name_, task_allocator_, endpoint))) {
+    } else {
+      ObAIFuncModel model(task_allocator_, *info, endpoint);
+      ObString content = task.prompt_;
+      ObString system_prompt = task.system_prompt_;
+      call_ret = model.call_completion_with_system(system_prompt, content, NULL, result_str);
+    }
+    ObSqlString update_sql;
+    if (OB_SUCCESS == call_ret) {
+      if (OB_FAIL(update_sql.append_fmt("update `%.*s`.`%.*s` set `%.*s` = '",
+                                        task.db_name_.length(), task.db_name_.ptr(),
+                                        task.table_name_.length(), task.table_name_.ptr(),
+                                        task.result_column_.length(), task.result_column_.ptr()))) {
+      } else if (OB_FAIL(ai_column_worker_helper::append_escaped(result_str, update_sql))) {
+      } else if (OB_FAIL(update_sql.append_fmt("' where %.*s and `%.*s` is null",
+                                               task.predicate_.length(), task.predicate_.ptr(),
+                                               task.result_column_.length(),
+                                               task.result_column_.ptr()))) {
+      }
+    } else {
+      LOG_INFO("ai column request failed", K(task.table_id_), K(call_ret));
+    }
+    if (OB_SUCC(ret) && !update_sql.empty()) {
+      int64_t affected = 0;
+      if (OB_FAIL(proxy->write(update_sql.string(), affected))) {
+        LOG_WARN("failed to write the ai column result", K(ret), K(call_ret));
+      } else {
+        LOG_INFO("ai column result written", K(task.table_id_), K(task.predicate_), K(affected));
+      }
+    }
+  }
+  task_queue_.reset();
+  task_allocator_.reset();
+  return ret;
+}
+
 int ObServer::ObAiColumnWorkerTask::process_once()
 {
   int ret = OB_SUCCESS;
-  ObArenaAllocator allocator("AiColWorker");
+  if (OB_FAIL(flush_pending_tasks())) {
+    LOG_WARN("failed to flush the pending ai column tasks", K(ret));
+    ret = OB_SUCCESS;
+  }
+  ObArenaAllocator &allocator = task_allocator_;
   struct PendingColumn {
     int64_t table_id_;
     int64_t column_id_;
@@ -2349,59 +2414,52 @@ int ObServer::ObAiColumnWorkerTask::process_once()
     ObString db_name_;
   };
   ObSEArray<PendingColumn, 4> columns;
-  sqlclient::ObISQLConnectionGuard conn_guard;
-  sqlclient::ObISQLConnection *conn = NULL;
-  if (OB_FAIL(ObInnerSQLConnection::create_connection_with_owned_session(false, 0, conn_guard))) {
-    LOG_WARN("failed to create the ai column worker connection", K(ret));
-  } else if (OB_ISNULL(conn = conn_guard.get_ptr())) {
+  ObMySQLProxy *proxy = NULL;
+  if (OB_ISNULL(obs_) || OB_ISNULL(proxy = &obs_->get_mysql_proxy())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("the ai column worker connection is null", K(ret));
-  }
-  // the metadata: one query, the result is fully consumed before the next statement
-  if (OB_SUCC(ret)) {
+  } else {
     ObSqlString meta_sql;
-    ObISQLClient::ReadResult meta_result;
     if (OB_FAIL(meta_sql.append(
             "select a.table_id, a.column_id, a.result_spec_column_id, a.max_retries, "
             "a.column_name, a.normalized_expr, t.table_name, d.database_name "
             "from oceanbase.__all_ai_column a "
             "join oceanbase.__all_table t on t.table_id = a.table_id "
             "join oceanbase.__all_database d on d.database_id = t.database_id "
-            "order by a.table_id desc limit 8"))) {
+            "order by a.table_id desc limit 4"))) {
       LOG_WARN("failed to build the ai column metadata query", K(ret));
-    } else if (OB_FAIL(conn->execute_read(meta_sql.string(), meta_result))) {
-      LOG_WARN("failed to read the ai column metadata", K(ret));
     } else {
-      sqlclient::ObMySQLResult *meta_rows = meta_result.get_result();
-      if (OB_ISNULL(meta_rows)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("the ai column metadata query returned no result", K(ret));
-      }
-      while (OB_SUCC(ret) && OB_SUCC(meta_rows->next())) {
-        PendingColumn column;
-        column.spec_column_id_ = 0;
-        column.max_retries_ = 0;
-        ObString tmp_name;
-        ObString tmp_spec;
-        ObString tmp_table;
-        ObString tmp_db;
-        if (OB_FAIL(meta_rows->get_int("table_id", column.table_id_))) {
-        } else if (OB_FAIL(meta_rows->get_int("column_id", column.column_id_))) {
-        } else if (OB_FAIL(meta_rows->get_int("result_spec_column_id", column.spec_column_id_))) {
-        } else if (OB_FAIL(meta_rows->get_int("max_retries", column.max_retries_))) {
-        } else if (OB_FAIL(meta_rows->get_varchar("column_name", tmp_name))) {
-        } else if (OB_FAIL(meta_rows->get_varchar("normalized_expr", tmp_spec))) {
-        } else if (OB_FAIL(meta_rows->get_varchar("table_name", tmp_table))) {
-        } else if (OB_FAIL(meta_rows->get_varchar("database_name", tmp_db))) {
-        } else if (OB_FAIL(ob_write_string(allocator, tmp_name, column.column_name_))) {
-        } else if (OB_FAIL(ob_write_string(allocator, tmp_spec, column.spec_))) {
-        } else if (OB_FAIL(ob_write_string(allocator, tmp_table, column.table_name_))) {
-        } else if (OB_FAIL(ob_write_string(allocator, tmp_db, column.db_name_))) {
-        } else if (OB_FAIL(columns.push_back(column))) {
+      SMART_VAR(ObMySQLProxy::MySQLResult, meta_result) {
+        if (OB_FAIL(proxy->read(meta_result, meta_sql.ptr()))) {
+          LOG_WARN("failed to read the ai column metadata", K(ret));
+        } else if (NULL != meta_result.get_result()) {
+          sqlclient::ObMySQLResult *rows = meta_result.get_result();
+          while (OB_SUCC(ret) && OB_SUCC(rows->next())) {
+            PendingColumn column;
+            column.spec_column_id_ = 0;
+            column.max_retries_ = 0;
+            ObString tmp_name;
+            ObString tmp_spec;
+            ObString tmp_table;
+            ObString tmp_db;
+            if (OB_FAIL(rows->get_int("table_id", column.table_id_))) {
+            } else if (OB_FAIL(rows->get_int("column_id", column.column_id_))) {
+            } else if (OB_FAIL(rows->get_int("result_spec_column_id", column.spec_column_id_))) {
+            } else if (OB_FAIL(rows->get_int("max_retries", column.max_retries_))) {
+            } else if (OB_FAIL(rows->get_varchar("column_name", tmp_name))) {
+            } else if (OB_FAIL(rows->get_varchar("normalized_expr", tmp_spec))) {
+            } else if (OB_FAIL(rows->get_varchar("table_name", tmp_table))) {
+            } else if (OB_FAIL(rows->get_varchar("database_name", tmp_db))) {
+            } else if (OB_FAIL(ob_write_string(allocator, tmp_name, column.column_name_))) {
+            } else if (OB_FAIL(ob_write_string(allocator, tmp_spec, column.spec_))) {
+            } else if (OB_FAIL(ob_write_string(allocator, tmp_table, column.table_name_))) {
+            } else if (OB_FAIL(ob_write_string(allocator, tmp_db, column.db_name_))) {
+            } else if (OB_FAIL(columns.push_back(column))) {
+            }
+          }
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          }
         }
-      }
-      if (OB_ITER_END == ret) {
-        ret = OB_SUCCESS;
       }
     }
   }
@@ -2409,14 +2467,9 @@ int ObServer::ObAiColumnWorkerTask::process_once()
   for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
     const PendingColumn &column = columns.at(i);
     char result_buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
-    char request_buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
     MEMSET(result_buf, 0, sizeof(result_buf));
-    MEMSET(request_buf, 0, sizeof(request_buf));
     const int64_t result_len = snprintf(result_buf, sizeof(result_buf), "%.*s",
                                         column.column_name_.length(), column.column_name_.ptr());
-    const int64_t request_len = snprintf(request_buf, sizeof(request_buf), "%.*s__ai_request",
-                                         column.column_name_.length(), column.column_name_.ptr());
-    // the expression text: the metadata keeps it, otherwise it is in the spec column comment
     ObString ai_expr = column.spec_;
     bool has_expr = false;
     for (int64_t k = 0; !has_expr && k + 12 <= ai_expr.length(); ++k) {
@@ -2424,19 +2477,21 @@ int ObServer::ObAiColumnWorkerTask::process_once()
     }
     if (!has_expr) {
       ObSqlString spec_sql;
-      ObISQLClient::ReadResult spec_result;
       ai_expr.reset();
       if (OB_FAIL(spec_sql.append_fmt("select comment from oceanbase.__all_column "
                                       "where table_id = %ld and column_id = %ld",
                                       column.table_id_, column.spec_column_id_))) {
-      } else if (OB_FAIL(conn->execute_read(spec_sql.string(), spec_result))) {
-        LOG_WARN("failed to read the ai column spec", K(ret));
       } else {
-        sqlclient::ObMySQLResult *spec_rows = spec_result.get_result();
-        ObString tmp_expr;
-        if (NULL != spec_rows && OB_SUCCESS == spec_rows->next()
-            && OB_SUCCESS == spec_rows->get_varchar("comment", tmp_expr)) {
-          (void)ob_write_string(allocator, tmp_expr, ai_expr);
+        SMART_VAR(ObMySQLProxy::MySQLResult, spec_result) {
+          if (OB_FAIL(proxy->read(spec_result, spec_sql.ptr()))) {
+            LOG_WARN("failed to read the ai column spec", K(ret));
+          } else if (NULL != spec_result.get_result()) {
+            sqlclient::ObMySQLResult *rows = spec_result.get_result();
+            ObString tmp_expr;
+            if (OB_SUCCESS == rows->next() && OB_SUCCESS == rows->get_varchar("comment", tmp_expr)) {
+              (void)ob_write_string(allocator, tmp_expr, ai_expr);
+            }
+          }
         }
       }
     }
@@ -2450,213 +2505,165 @@ int ObServer::ObAiColumnWorkerTask::process_once()
       ret = OB_SUCCESS;
       continue;
     }
-    // the rowkey column of the ai table
+    ObString data_type;
     ObString pk_name;
     {
       ObSqlString ddl_sql;
-      ObISQLClient::ReadResult ddl_result;
       if (OB_FAIL(ddl_sql.append_fmt("show create table `%.*s`.`%.*s`",
                                      column.db_name_.length(), column.db_name_.ptr(),
                                      column.table_name_.length(), column.table_name_.ptr()))) {
-      } else if (OB_FAIL(conn->execute_read(ddl_sql.string(), ddl_result))) {
-        LOG_WARN("failed to read the table ddl", K(ret));
       } else {
-        sqlclient::ObMySQLResult *ddl_rows = ddl_result.get_result();
-        ObString ddl;
-        if (NULL != ddl_rows && OB_SUCCESS == ddl_rows->next()
-            && OB_SUCCESS == ddl_rows->get_varchar(1, ddl)) {
-          int64_t key_pos = -1;
-          for (int64_t k = 0; -1 == key_pos && k + 12 <= ddl.length(); ++k) {
-            if (ai_column_worker_helper::match_ci(ddl, k, "primary key (")) {
-              key_pos = k + 13;
+        SMART_VAR(ObMySQLProxy::MySQLResult, ddl_result) {
+          if (OB_FAIL(proxy->read(ddl_result, ddl_sql.ptr()))) {
+            LOG_WARN("failed to read the table ddl", K(ret));
+          } else if (NULL != ddl_result.get_result()) {
+            sqlclient::ObMySQLResult *rows = ddl_result.get_result();
+            ObString ddl;
+            if (OB_SUCCESS == rows->next() && OB_SUCCESS == rows->get_varchar(1, ddl)) {
+              int64_t key_pos = -1;
+              for (int64_t k = 0; -1 == key_pos && k + 12 <= ddl.length(); ++k) {
+                if (ai_column_worker_helper::match_ci(ddl, k, "primary key (")) {
+                  key_pos = k + 13;
+                }
+              }
+              if (-1 != key_pos) {
+                int64_t begin = key_pos;
+                while (begin < ddl.length()
+                       && (isspace(static_cast<unsigned char>(ddl.ptr()[begin]))
+                           || '`' == ddl.ptr()[begin])) {
+                  ++begin;
+                }
+                int64_t finish = begin;
+                while (finish < ddl.length() && '`' != ddl.ptr()[finish]
+                       && ',' != ddl.ptr()[finish] && ')' != ddl.ptr()[finish]) {
+                  ++finish;
+                }
+                (void)ob_write_string(allocator, ObString(static_cast<int32_t>(finish - begin),
+                                                          ddl.ptr() + begin), pk_name);
+              }
+              for (int64_t k = 0; data_type.empty()
+                   && k + column.column_name_.length() <= ddl.length(); ++k) {
+                if (0 == strncasecmp(ddl.ptr() + k, column.column_name_.ptr(),
+                                     column.column_name_.length())) {
+                  int64_t type_begin = k + column.column_name_.length();
+                  while (type_begin < ddl.length()
+                         && (isspace(static_cast<unsigned char>(ddl.ptr()[type_begin]))
+                             || '`' == ddl.ptr()[type_begin])) {
+                    ++type_begin;
+                  }
+                  int64_t type_end = type_begin;
+                  while (type_end < ddl.length()
+                         && isalpha(static_cast<unsigned char>(ddl.ptr()[type_end]))) {
+                    ++type_end;
+                  }
+                  if (type_end > type_begin) {
+                    (void)ob_write_string(allocator,
+                        ObString(static_cast<int32_t>(type_end - type_begin), ddl.ptr() + type_begin),
+                        data_type);
+                  }
+                }
+              }
             }
           }
-          if (-1 != key_pos) {
-            int64_t begin = key_pos;
-            while (begin < ddl.length()
-                   && (isspace(static_cast<unsigned char>(ddl.ptr()[begin]))
-                       || '`' == ddl.ptr()[begin])) {
-              ++begin;
-            }
-            int64_t finish = begin;
-            while (finish < ddl.length() && '`' != ddl.ptr()[finish] && ',' != ddl.ptr()[finish]
-                   && ')' != ddl.ptr()[finish]) {
-              ++finish;
-            }
-            (void)ob_write_string(allocator, ObString(static_cast<int32_t>(finish - begin),
-                                                      ddl.ptr() + begin), pk_name);
-          }
-        }
-      }
-    }
-    LOG_INFO("ai column worker rowkey", K(pk_name));
-    if (OB_FAIL(ret) || pk_name.empty()) {
-      continue;
-    }
-    // the pending rows of this ai column
-    ObSEArray<ObString, 8> predicates;
-    {
-      ObSqlString row_sql;
-      ObISQLClient::ReadResult row_result;
-      if (OB_FAIL(row_sql.append_fmt(
-              "select concat('`', '%.*s', '` = ', `%.*s`) as pred from `%.*s`.`%.*s` "
-              "where `%.*s` is null and (`%.*s` is null or `%.*s` like 'retry:%%') limit 8",
-              pk_name.length(), pk_name.ptr(), pk_name.length(), pk_name.ptr(),
-              column.db_name_.length(), column.db_name_.ptr(),
-              column.table_name_.length(), column.table_name_.ptr(),
-              result_len, result_buf, request_len, request_buf, request_len, request_buf))) {
-        LOG_WARN("failed to build the pending row query", K(ret));
-      } else if (OB_FAIL(conn->execute_read(row_sql.string(), row_result))) {
-        LOG_WARN("failed to read the pending rows", K(ret), K(row_sql));
-      } else {
-        sqlclient::ObMySQLResult *row_rows = row_result.get_result();
-        while (OB_SUCC(ret) && NULL != row_rows && OB_SUCC(row_rows->next())) {
-          ObString tmp_pred;
-          ObString pred;
-          if (OB_FAIL(row_rows->get_varchar("pred", tmp_pred))) {
-          } else if (OB_FAIL(ob_write_string(allocator, tmp_pred, pred))) {
-          } else if (OB_FAIL(predicates.push_back(pred))) {
-          }
-        }
-        if (OB_ITER_END == ret) {
-          ret = OB_SUCCESS;
-        }
-      }
-    }
-    LOG_INFO("ai column worker pending rows", K(ret), K(column.table_id_), K(column.column_id_),
-             "row_count", predicates.count());
-    // the typed system prompt follows the result column type
-    ObString data_type;
-    {
-      ObSqlString type_sql;
-      ObISQLClient::ReadResult type_result;
-      if (OB_FAIL(type_sql.append_fmt("select data_type from oceanbase.__all_column "
-                                      "where table_id = %ld and column_name = '%.*s'",
-                                      column.table_id_, column.column_name_.length(),
-                                      column.column_name_.ptr()))) {
-      } else if (OB_FAIL(conn->execute_read(type_sql.string(), type_result))) {
-        LOG_WARN("failed to read the ai result column type", K(ret));
-      } else {
-        sqlclient::ObMySQLResult *type_rows = type_result.get_result();
-        ObString tmp_type;
-        if (NULL != type_rows && OB_SUCCESS == type_rows->next()
-            && OB_SUCCESS == type_rows->get_varchar("data_type", tmp_type)) {
-          (void)ob_write_string(allocator, tmp_type, data_type);
         }
       }
     }
     ObString system_prompt;
     if (0 == data_type.case_compare("json")) {
       system_prompt = ObString::make_string("Return exactly one valid JSON value");
-    } else if (data_type.length() > 3 && 0 == data_type.case_compare("bigint")) {
-      system_prompt = ObString::make_string("Return exactly one base-10 integer");
-    } else if (data_type.length() > 3 && 0 == data_type.case_compare("int")) {
+    } else if (0 == data_type.case_compare("bigint") || 0 == data_type.case_compare("int")
+               || 0 == data_type.case_compare("integer")) {
       system_prompt = ObString::make_string("Return exactly one base-10 integer");
     } else {
-      system_prompt = column.spec_;
+      system_prompt = ai_expr;
     }
-    LOG_INFO("ai column worker typed prompt", K(data_type), K(system_prompt));
+    LOG_INFO("ai column worker column", K(pk_name), K(data_type), K(system_prompt));
+    if (OB_FAIL(ret) || pk_name.empty()) {
+      continue;
+    }
+    ObSqlString row_sql;
+    ObSEArray<ObString, 8> predicates;
+    if (OB_FAIL(row_sql.append_fmt(
+            "select concat('`', '%.*s', '` = ', `%.*s`) as pred from `%.*s`.`%.*s` "
+            "where `%.*s` is null limit 8",
+            pk_name.length(), pk_name.ptr(), pk_name.length(), pk_name.ptr(),
+            column.db_name_.length(), column.db_name_.ptr(),
+            column.table_name_.length(), column.table_name_.ptr(),
+            result_len, result_buf))) {
+      LOG_WARN("failed to build the pending row query", K(ret));
+    } else {
+      SMART_VAR(ObMySQLProxy::MySQLResult, row_result) {
+        if (OB_FAIL(proxy->read(row_result, row_sql.ptr()))) {
+          LOG_WARN("failed to read the pending rows", K(ret));
+        } else if (NULL != row_result.get_result()) {
+          sqlclient::ObMySQLResult *rows = row_result.get_result();
+          while (OB_SUCC(ret) && OB_SUCC(rows->next())) {
+            ObString tmp_pred;
+            ObString pred;
+            if (OB_FAIL(rows->get_varchar("pred", tmp_pred))) {
+            } else if (OB_FAIL(ob_write_string(allocator, tmp_pred, pred))) {
+            } else if (OB_FAIL(predicates.push_back(pred))) {
+            }
+          }
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          }
+        }
+      }
+    }
+    LOG_INFO("ai column worker pending rows", K(ret), K(column.table_id_), K(column.column_id_),
+             "row_count", predicates.count());
     for (int64_t j = 0; OB_SUCC(ret) && j < predicates.count(); ++j) {
       const ObString &predicate = predicates.at(j);
-      // the prompt of this row
       ObString prompt;
       {
         ObSqlString prompt_sql;
-        ObISQLClient::ReadResult prompt_result;
         if (OB_FAIL(prompt_sql.append_fmt("select %.*s as prompt from `%.*s`.`%.*s` where %.*s",
                                           prompt_expr.length(), prompt_expr.ptr(),
                                           column.db_name_.length(), column.db_name_.ptr(),
                                           column.table_name_.length(), column.table_name_.ptr(),
                                           predicate.length(), predicate.ptr()))) {
           LOG_WARN("failed to build the prompt query", K(ret));
-        } else if (OB_FAIL(conn->execute_read(prompt_sql.string(), prompt_result))) {
-          LOG_WARN("failed to read the prompt", K(ret));
         } else {
-          sqlclient::ObMySQLResult *prompt_rows = prompt_result.get_result();
-          ObString tmp_prompt;
-          if (NULL != prompt_rows && OB_SUCCESS == prompt_rows->next()
-              && OB_SUCCESS == prompt_rows->get_varchar("prompt", tmp_prompt)) {
-            (void)ob_write_string(allocator, tmp_prompt, prompt);
+          SMART_VAR(ObMySQLProxy::MySQLResult, prompt_result) {
+            if (OB_FAIL(proxy->read(prompt_result, prompt_sql.ptr()))) {
+              LOG_WARN("failed to read the prompt", K(ret));
+            } else if (NULL != prompt_result.get_result()) {
+              sqlclient::ObMySQLResult *rows = prompt_result.get_result();
+              ObString tmp_prompt;
+              if (OB_SUCCESS == rows->next() && OB_SUCCESS == rows->get_varchar("prompt", tmp_prompt)) {
+                (void)ob_write_string(allocator, tmp_prompt, prompt);
+              }
+            }
           }
         }
       }
       if (OB_FAIL(ret) || prompt.empty()) {
-        LOG_INFO("ai column worker empty prompt", K(ret), K(prompt_expr), K(prompt));
         continue;
       }
-      LOG_INFO("ai column worker prompt", K(prompt_expr), K(prompt));
-      // call the model, the typed result spec is the system message
-      ObAIFuncExprInfo *info = NULL;
-      ObString result_str;
-      int call_ret = OB_SUCCESS;
-      share::ObAiModelEndpointInfo endpoint;
-      query::ObIAiEndpointResolver *resolver = share::server_service<query::ObIAiEndpointResolver>();
-      LOG_INFO("ai column worker call start", K(model_name));
-      if (NULL == resolver) {
-        call_ret = OB_ERR_UNEXPECTED;
-      } else if (OB_SUCCESS != (call_ret = ObAIFuncUtils::get_ai_func_info(allocator, model_name,
-                                                                           info))) {
-      } else if (OB_SUCCESS != (call_ret = resolver->resolve_by_model_name(model_name, allocator,
-                                                                           endpoint))) {
+      AiTaskRow task;
+      task.table_id_ = column.table_id_;
+      task.max_retries_ = column.max_retries_;
+      task.prompt_ = prompt;
+      task.predicate_ = predicate;
+      task.system_prompt_ = system_prompt;
+      task.model_name_ = model_name;
+      ObString db_name;
+      ObString table_name;
+      ObString result_column;
+      if (OB_FAIL(ob_write_string(allocator, column.db_name_, db_name))) {
+      } else if (OB_FAIL(ob_write_string(allocator, column.table_name_, table_name))) {
+      } else if (OB_FAIL(ob_write_string(allocator, column.column_name_, result_column))) {
       } else {
-        ObAIFuncModel model(allocator, *info, endpoint);
-        ObString content = prompt;
-        call_ret = model.call_completion_with_system(system_prompt, content, NULL, result_str);
-        LOG_INFO("ai column worker call done", K(call_ret), K(result_str));
-      }
-      ObSqlString update_sql;
-      if (OB_SUCCESS == call_ret) {
-        ObString result_copy;
-        if (OB_FAIL(update_sql.append_fmt("update `%.*s`.`%.*s` set `%.*s` = '",
-                                          column.db_name_.length(), column.db_name_.ptr(),
-                                          column.table_name_.length(), column.table_name_.ptr(),
-                                          result_len, result_buf))) {
-        } else if (OB_FAIL(ai_column_worker_helper::append_escaped(result_str, update_sql))) {
-        } else if (OB_FAIL(update_sql.append_fmt("' where %.*s and `%.*s` is null",
-                                                 predicate.length(), predicate.ptr(),
-                                                 result_len, result_buf))) {
-        }
-      } else {
-        ObString request_state = (column.max_retries_ <= 0) ? ObString::make_string("abandoned")
-                                                           : ObString::make_string("retry:1");
-        if (OB_FAIL(update_sql.append_fmt("update `%.*s`.`%.*s` set `%.*s` = '%.*s' "
-                                          "where %.*s and `%.*s` is null",
-                                          column.db_name_.length(), column.db_name_.ptr(),
-                                          column.table_name_.length(), column.table_name_.ptr(),
-                                          request_len, request_buf,
-                                          request_state.length(), request_state.ptr(),
-                                          predicate.length(), predicate.ptr(),
-                                          result_len, result_buf))) {
-        }
-      }
-      if (OB_SUCC(ret) && !update_sql.empty()) {
-        int64_t affected = 0;
-        LOG_INFO("ai column worker write", K(update_sql), K(call_ret));
-        if (OB_ISNULL(obs_)) {
-          ret = OB_ERR_UNEXPECTED;
-        } else {
-          ObWorkerSessionGuard worker_session_guard(&static_cast<ObInnerSQLConnection *>(conn)->get_session());
-          ret = conn->execute_write(update_sql.string(), affected);
-        }
-        if (OB_SUCC(ret) && affected > 0) {
-          int commit_ret = conn->commit();
-          if (OB_SUCCESS != commit_ret) {
-            LOG_WARN("failed to commit the ai column result", K(commit_ret));
-          }
-        }
-        if (OB_FAIL(ret)) {
-          LOG_WARN("failed to write the ai column result", K(ret), K(call_ret), K(affected));
-        } else if (0 == affected) {
-          LOG_INFO("ai column result write matched no row", K(predicate), K(call_ret));
-        } else if (OB_SUCCESS != call_ret) {
-          LOG_INFO("ai column request failed", K(column.table_id_), K(predicate), K(call_ret),
-                   K(affected));
-        } else {
-          LOG_INFO("ai column result written", K(column.table_id_), K(predicate), K(affected));
+        task.db_name_ = db_name;
+        task.table_name_ = table_name;
+        task.result_column_ = result_column;
+        if (OB_FAIL(task_queue_.push_back(task))) {
         }
       }
     }
   }
+  LOG_INFO("ai column worker tasks queued", K(ret), "task_count", task_queue_.count());
   return ret;
 }
 

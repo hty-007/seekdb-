@@ -283,15 +283,30 @@ public:
   class ObAiColumnWorkerTask: public common::ObTimerTask
   {
   public:
-    ObAiColumnWorkerTask() : obs_(NULL), is_inited_(false) {}
+    struct AiTaskRow {
+      int64_t table_id_;
+      int64_t max_retries_;
+      common::ObString db_name_;
+      common::ObString table_name_;
+      common::ObString result_column_;
+      common::ObString predicate_;
+      common::ObString prompt_;
+      common::ObString system_prompt_;
+      common::ObString model_name_;
+    };
+    ObAiColumnWorkerTask() : obs_(NULL), is_inited_(false), busy_(false) {}
     virtual ~ObAiColumnWorkerTask() {}
     int init(ObServer &observer, common::ObTimer& timer);
     virtual void runTimerTask() override;
   private:
     int process_once();
+    int flush_pending_tasks();
     const static int64_t POLL_INTERVAL_US = 500 * 1000L;//500ms
     ObServer *obs_;
     bool is_inited_;
+    volatile bool busy_;
+    common::ObArenaAllocator task_allocator_;
+    common::ObSEArray<AiTaskRow, 8> task_queue_;
   };
 
   class ObRefreshCpuFreqTimeTask: public common::ObTimerTask
