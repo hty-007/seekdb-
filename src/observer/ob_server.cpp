@@ -2188,11 +2188,13 @@ int ObServer::init_network()
 }
 
 
-int ObServer::ObAiColumnWorkerTask::init(common::ObTimer &timer)
+int ObServer::ObAiColumnWorkerTask::init(ObServer &observer, common::ObTimer &timer)
 {
   int ret = OB_SUCCESS;
   if (is_inited_) {
     ret = OB_INIT_TWICE;
+  } else if (OB_ISNULL(obs_ = &observer)) {
+    ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(timer.schedule(*this, POLL_INTERVAL_US, true /*repeat*/, false))) {
     LOG_WARN("failed to schedule the ai column worker", K(ret));
   } else {
@@ -2581,8 +2583,7 @@ int ObServer::ObAiColumnWorkerTask::process_once()
                                           column.table_name_.length(), column.table_name_.ptr(),
                                           result_len, result_buf))) {
         } else if (OB_FAIL(ai_column_worker_helper::append_escaped(result_str, update_sql))) {
-        } else if (OB_FAIL(update_sql.append_fmt("', `%.*s` = null where %.*s and `%.*s` is null",
-                                                 request_len, request_buf,
+        } else if (OB_FAIL(update_sql.append_fmt("' where %.*s and `%.*s` is null",
                                                  predicate.length(), predicate.ptr(),
                                                  result_len, result_buf))) {
         }
@@ -2602,11 +2603,10 @@ int ObServer::ObAiColumnWorkerTask::process_once()
       if (OB_SUCC(ret) && !update_sql.empty()) {
         int64_t affected = 0;
         LOG_INFO("ai column worker write", K(update_sql), K(call_ret));
-        if (OB_FAIL(conn->execute_write(update_sql.string(), affected, true /*is_user_sql*/))) {
+        if (OB_ISNULL(obs_)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(obs_->get_mysql_proxy().write(update_sql.string(), affected))) {
           LOG_WARN("failed to write the ai column result", K(ret), K(call_ret));
-          (void)conn->rollback();
-        } else if (OB_FAIL(conn->commit())) {
-          LOG_WARN("failed to commit the ai column result", K(ret));
         } else if (OB_SUCCESS != call_ret) {
           LOG_INFO("ai column request failed", K(column.table_id_), K(predicate), K(call_ret),
                    K(affected));
@@ -2629,7 +2629,7 @@ int ObServer::init_server_runtime()
   if (OB_SUCC(ret)) {
     if (OB_FAIL(duty_task_.schedule(server_gtimer_))) {
     } else if (OB_FAIL(sql_mem_task_.schedule(sql_mem_timer_))) {
-    } else if (OB_FAIL(ai_column_worker_task_.init(server_gtimer_))) {
+    } else if (OB_FAIL(ai_column_worker_task_.init(*this, server_gtimer_))) {
     }
   }
 

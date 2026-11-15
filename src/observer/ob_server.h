@@ -283,13 +283,14 @@ public:
   class ObAiColumnWorkerTask: public common::ObTimerTask
   {
   public:
-    ObAiColumnWorkerTask() : is_inited_(false) {}
+    ObAiColumnWorkerTask() : obs_(NULL), is_inited_(false) {}
     virtual ~ObAiColumnWorkerTask() {}
-    int init(common::ObTimer& timer);
+    int init(ObServer &observer, common::ObTimer& timer);
     virtual void runTimerTask() override;
   private:
     int process_once();
     const static int64_t POLL_INTERVAL_US = 500 * 1000L;//500ms
+    ObServer *obs_;
     bool is_inited_;
   };
 
