@@ -115,7 +115,8 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
   //add column for table scan, keep rowkey column in the head
   if (OB_SUCC(ret)) {
     for (int64_t i = 0; OB_SUCC(ret) && i < tables_assign.count(); i++) {
-      if (OB_FAIL(generate_update_table_info(tables_assign.at(i)))) {
+      if (OB_FAIL(invalidate_ai_columns(tables_assign.at(i)))) {
+      } else if (OB_FAIL(generate_update_table_info(tables_assign.at(i)))) {
       } else { /*do nothing*/ }
     }
   }
@@ -149,6 +150,212 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     } else if (OB_FAIL(update_stmt->check_dml_source_from_join())) {
     } else if (OB_FAIL(check_safe_update_mode(update_stmt))) {
     } else { /*do nothing*/ }
+  }
+  return ret;
+}
+
+
+namespace {
+
+// An ai column keeps three hidden companion columns: <col>__ai_state,
+// <col>__ai_request and <col>__ai_result_spec. The model expression is stored in
+// the comment of the result-spec column as
+//   ai_expr=<text>\nsync_mode=<mode>\nmax_retries=<n>
+// Updating a column the expression reads (or a rowkey column, the worker locates
+// rows by primary key) invalidates the ai column: the cached result is cleared and
+// the state is reset, so the asynchronous worker recomputes it.
+static const char *AI_COLUMN_STATE_SUFFIX = "__ai_state";
+static const char *AI_COLUMN_RESULT_SPEC_SUFFIX = "__ai_result_spec";
+static const char *AI_COLUMN_EXPR_PREFIX = "ai_expr=";
+
+static int64_t find_bytes(const char *buf, int64_t len, const char *pattern)
+{
+  int64_t pos = -1;
+  const int64_t pattern_len = static_cast<int64_t>(strlen(pattern));
+  for (int64_t i = 0; -1 == pos && i + pattern_len <= len; ++i) {
+    if (0 == strncmp(buf + i, pattern, pattern_len)) {
+      pos = i;
+    }
+  }
+  return pos;
+}
+
+static bool is_ident_char(char c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+         || '_' == c || '$' == c;
+}
+
+// whether the stored ai expression references the given column
+static bool ai_expr_reads_column(const char *expr, int64_t len, const ObString &column_name)
+{
+  bool found = false;
+  char ident[OB_MAX_COLUMN_NAME_LENGTH + 1];
+  for (int64_t i = 0; !found && i < len; ) {
+    const char c = expr[i];
+    if ('\'' == c || '"' == c || '`' == c) {
+      const char quote = c;
+      ++i;
+      while (i < len && expr[i] != quote) {
+        if ('\\' == expr[i]) {
+          ++i;
+        }
+        ++i;
+      }
+      ++i;
+    } else if (is_ident_char(c) && (c < '0' || c > '9')) {
+      int64_t ident_len = 0;
+      while (i < len && is_ident_char(expr[i]) && ident_len < OB_MAX_COLUMN_NAME_LENGTH) {
+        ident[ident_len++] = expr[i++];
+      }
+      while (i < len && is_ident_char(expr[i])) {
+        ++i;
+      }
+      int64_t next = i;
+      while (next < len && isspace(static_cast<unsigned char>(expr[next]))) {
+        ++next;
+      }
+      const bool is_call = (next < len && '(' == expr[next]);
+      if (!is_call && ident_len > 0
+          && 0 == ObString(static_cast<int32_t>(ident_len), ident).case_compare(column_name)) {
+        found = true;
+      }
+    } else {
+      ++i;
+    }
+  }
+  return found;
+}
+
+} // namespace
+
+int ObUpdateResolver::invalidate_ai_columns(ObTableAssignment &table_assign)
+{
+  int ret = OB_SUCCESS;
+  ObUpdateStmt *stmt = get_update_stmt();
+  const TableItem *table_item = NULL;
+  const ObTableSchema *table_schema = NULL;
+  ObRawExprFactory *expr_factory = params_.expr_factory_;
+  if (OB_ISNULL(stmt) || OB_ISNULL(schema_checker_) || OB_ISNULL(expr_factory)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("resolver is not ready", K(ret), K(stmt), K(schema_checker_), K(expr_factory));
+  } else if (OB_ISNULL(table_item = stmt->get_table_item_by_id(table_assign.table_id_))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table item not found", K(ret), K(table_assign.table_id_));
+  } else if (!table_item->is_basic_table()) {
+    // the ai columns of a view live on its base tables
+  } else if (OB_FAIL(schema_checker_->get_table_schema(table_item->ref_id_, table_schema))) {
+    LOG_WARN("failed to get table schema", K(ret), K(table_item->ref_id_));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table schema is null", K(ret), K(table_item->ref_id_));
+  } else {
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *state_column = *iter;
+      const ObString state_name = (NULL == state_column)
+                                       ? ObString() : state_column->get_column_name_str();
+      const int64_t state_suffix_len = static_cast<int64_t>(strlen(AI_COLUMN_STATE_SUFFIX));
+      if (NULL == state_column || !state_column->is_hidden()
+          || state_name.length() <= state_suffix_len) {
+        continue;
+      } else if (0 != ObString(state_suffix_len,
+                               state_name.ptr() + state_name.length() - state_suffix_len)
+                          .case_compare(AI_COLUMN_STATE_SUFFIX)) {
+        continue;
+      }
+      const ObString ai_name(state_name.length() - static_cast<int32_t>(state_suffix_len),
+                             state_name.ptr());
+      const ObColumnSchemaV2 *result_column = table_schema->get_column_schema(ai_name);
+      char spec_name_buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
+      MEMSET(spec_name_buf, 0, sizeof(spec_name_buf));
+      const int64_t spec_len = snprintf(spec_name_buf, sizeof(spec_name_buf), "%.*s%s",
+                                        ai_name.length(), ai_name.ptr(),
+                                        AI_COLUMN_RESULT_SPEC_SUFFIX);
+      const ObColumnSchemaV2 *spec_column = NULL;
+      if (OB_ISNULL(result_column)) {
+        // not a regular ai column
+      } else if (spec_len <= 0 || spec_len > OB_MAX_COLUMN_NAME_LENGTH) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("ai column spec name is too long", K(ret), K(spec_len));
+      } else if (OB_ISNULL(spec_column = table_schema->get_column_schema(
+                               ObString(static_cast<int32_t>(spec_len), spec_name_buf)))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("ai column has no result spec column", K(ret), K(ai_name));
+      } else {
+        const ObString &comment = spec_column->get_comment_str();
+        const int64_t expr_prefix =
+            find_bytes(comment.ptr(), comment.length(), AI_COLUMN_EXPR_PREFIX);
+        const char *expr_begin = NULL;
+        int64_t expr_len = 0;
+        if (expr_prefix < 0) {
+          continue;
+        } else {
+          expr_begin = comment.ptr() + expr_prefix + strlen(AI_COLUMN_EXPR_PREFIX);
+          int64_t expr_end = expr_prefix + static_cast<int64_t>(strlen(AI_COLUMN_EXPR_PREFIX));
+          while (expr_end < comment.length() && '\n' != comment.ptr()[expr_end]) {
+            ++expr_end;
+          }
+          expr_len = expr_end - (expr_prefix + strlen(AI_COLUMN_EXPR_PREFIX));
+        }
+        bool touched = false;
+        bool user_sets_result = false;
+        for (int64_t i = 0; OB_SUCC(ret) && !user_sets_result && i < table_assign.assignments_.count(); ++i) {
+          const ObAssignment &assign = table_assign.assignments_.at(i);
+          const ObColumnSchemaV2 *column = NULL;
+          if (OB_ISNULL(assign.column_expr_)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("assignment has no column", K(ret));
+          } else if (OB_ISNULL(column = table_schema->get_column_schema(
+                                   assign.column_expr_->get_column_id()))) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("assignment column not found", K(ret),
+                     K(assign.column_expr_->get_column_id()));
+          } else if (column->get_column_id() == result_column->get_column_id()) {
+            user_sets_result = true;
+          } else if (!touched
+                     && (column->is_rowkey_column() || column->is_part_key_column()
+                         || ai_expr_reads_column(expr_begin, expr_len,
+                                                 column->get_column_name_str()))) {
+            touched = true;
+          }
+        }
+        if (OB_SUCC(ret) && touched && !user_sets_result) {
+          ObSEArray<ObColumnRefRawExpr *, 2> result_exprs;
+          ObSEArray<ObColumnRefRawExpr *, 2> state_exprs;
+          ObRawExpr *null_expr = NULL;
+          ObConstRawExpr *zero_expr = NULL;
+          if (OB_FAIL(add_column_to_stmt(*table_item, *result_column, result_exprs))) {
+            LOG_WARN("failed to add the ai result column to stmt", K(ret));
+          } else if (OB_FAIL(add_column_to_stmt(*table_item, *state_column, state_exprs))) {
+            LOG_WARN("failed to add the ai state column to stmt", K(ret));
+          } else if (result_exprs.count() != 1 || state_exprs.count() != 1) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected column count", K(ret), K(result_exprs.count()),
+                     K(state_exprs.count()));
+          } else if (OB_FAIL(ObRawExprUtils::build_null_expr(*expr_factory, null_expr))) {
+            LOG_WARN("failed to build the null expression", K(ret));
+          } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(
+                         *expr_factory, ObIntType, 0, zero_expr))) {
+            LOG_WARN("failed to build the ai state expression", K(ret));
+          } else {
+            ObAssignment result_assign;
+            ObAssignment state_assign;
+            result_assign.column_expr_ = result_exprs.at(0);
+            result_assign.expr_ = null_expr;
+            result_assign.is_implicit_ = true;
+            state_assign.column_expr_ = state_exprs.at(0);
+            state_assign.expr_ = zero_expr;
+            state_assign.is_implicit_ = true;
+            if (OB_FAIL(table_assign.assignments_.push_back(result_assign))) {
+              LOG_WARN("failed to invalidate the ai result column", K(ret));
+            } else if (OB_FAIL(table_assign.assignments_.push_back(state_assign))) {
+              LOG_WARN("failed to reset the ai state column", K(ret));
+            }
+          }
+        }
+      }
+    }
   }
   return ret;
 }

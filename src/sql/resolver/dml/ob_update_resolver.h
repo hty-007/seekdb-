@@ -47,6 +47,8 @@ public:
 private:
   int resolve_table_list(const ParseNode &parse_tree);
   int generate_update_table_info(ObTableAssignment &table_assign);
+  // clear the result of every ai column that depends on an updated column
+  int invalidate_ai_columns(ObTableAssignment &table_assign);
   int check_multi_update_table_conflict();
   int check_join_update_conflict();
   int is_join_table_update(const ObDMLStmt *stmt, bool &is_multi_table);
