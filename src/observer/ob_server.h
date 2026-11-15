@@ -286,6 +286,8 @@ public:
     struct AiTaskRow {
       int64_t table_id_;
       int64_t max_retries_;
+      int64_t attempt_;
+      bool is_integer_;
       common::ObString db_name_;
       common::ObString table_name_;
       common::ObString result_column_;
@@ -301,7 +303,7 @@ public:
   private:
     int process_once();
     int flush_pending_tasks();
-    const static int64_t POLL_INTERVAL_US = 500 * 1000L;//500ms
+    const static int64_t POLL_INTERVAL_US = 100 * 1000L;//100ms
     ObServer *obs_;
     bool is_inited_;
     volatile bool busy_;

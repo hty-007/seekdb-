@@ -272,6 +272,12 @@ int ObUpdateResolver::invalidate_ai_columns(ObTableAssignment &table_assign)
       const int64_t spec_len = snprintf(spec_name_buf, sizeof(spec_name_buf), "%.*s%s",
                                         ai_name.length(), ai_name.ptr(),
                                         AI_COLUMN_RESULT_SPEC_SUFFIX);
+      char request_name_buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
+      MEMSET(request_name_buf, 0, sizeof(request_name_buf));
+      const int64_t request_name_len = snprintf(request_name_buf, sizeof(request_name_buf),
+                                                "%.*s__ai_request",
+                                                ai_name.length(), ai_name.ptr());
+      const ObColumnSchemaV2 *request_column = NULL;
       const ObColumnSchemaV2 *spec_column = NULL;
       if (OB_ISNULL(result_column)) {
         // not a regular ai column
@@ -282,6 +288,12 @@ int ObUpdateResolver::invalidate_ai_columns(ObTableAssignment &table_assign)
                                ObString(static_cast<int32_t>(spec_len), spec_name_buf)))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("ai column has no result spec column", K(ret), K(ai_name));
+      } else if (request_name_len <= 0 || request_name_len > OB_MAX_COLUMN_NAME_LENGTH
+                 || OB_ISNULL(request_column = table_schema->get_column_schema(
+                                  ObString(static_cast<int32_t>(request_name_len),
+                                           request_name_buf)))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("ai column has no request column", K(ret), K(ai_name));
       } else {
         const ObString &comment = spec_column->get_comment_str();
         const int64_t expr_prefix =
@@ -323,13 +335,17 @@ int ObUpdateResolver::invalidate_ai_columns(ObTableAssignment &table_assign)
         if (OB_SUCC(ret) && touched && !user_sets_result) {
           ObSEArray<ObColumnRefRawExpr *, 2> result_exprs;
           ObSEArray<ObColumnRefRawExpr *, 2> state_exprs;
+          ObSEArray<ObColumnRefRawExpr *, 2> request_exprs;
           ObRawExpr *null_expr = NULL;
           ObConstRawExpr *zero_expr = NULL;
           if (OB_FAIL(add_column_to_stmt(*table_item, *result_column, result_exprs))) {
             LOG_WARN("failed to add the ai result column to stmt", K(ret));
           } else if (OB_FAIL(add_column_to_stmt(*table_item, *state_column, state_exprs))) {
             LOG_WARN("failed to add the ai state column to stmt", K(ret));
-          } else if (result_exprs.count() != 1 || state_exprs.count() != 1) {
+          } else if (OB_FAIL(add_column_to_stmt(*table_item, *request_column, request_exprs))) {
+            LOG_WARN("failed to add the ai request column to stmt", K(ret));
+          } else if (result_exprs.count() != 1 || state_exprs.count() != 1
+                     || request_exprs.count() != 1) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("unexpected column count", K(ret), K(result_exprs.count()),
                      K(state_exprs.count()));
@@ -341,16 +357,22 @@ int ObUpdateResolver::invalidate_ai_columns(ObTableAssignment &table_assign)
           } else {
             ObAssignment result_assign;
             ObAssignment state_assign;
+            ObAssignment request_assign;
             result_assign.column_expr_ = result_exprs.at(0);
             result_assign.expr_ = null_expr;
             result_assign.is_implicit_ = true;
             state_assign.column_expr_ = state_exprs.at(0);
             state_assign.expr_ = zero_expr;
             state_assign.is_implicit_ = true;
+            request_assign.column_expr_ = request_exprs.at(0);
+            request_assign.expr_ = null_expr;
+            request_assign.is_implicit_ = true;
             if (OB_FAIL(table_assign.assignments_.push_back(result_assign))) {
               LOG_WARN("failed to invalidate the ai result column", K(ret));
             } else if (OB_FAIL(table_assign.assignments_.push_back(state_assign))) {
               LOG_WARN("failed to reset the ai state column", K(ret));
+            } else if (OB_FAIL(table_assign.assignments_.push_back(request_assign))) {
+              LOG_WARN("failed to clear the ai request column", K(ret));
             }
           }
         }

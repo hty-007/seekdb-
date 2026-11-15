@@ -2344,49 +2344,175 @@ int ObServer::ObAiColumnWorkerTask::flush_pending_tasks()
 {
   int ret = OB_SUCCESS;
   ObMySQLProxy *proxy = NULL;
+  const int64_t task_count = task_queue_.count();
+  bool *handled = NULL;
   if (OB_ISNULL(obs_) || OB_ISNULL(proxy = &obs_->get_mysql_proxy())) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (task_count > 0
+             && OB_ISNULL(handled = static_cast<bool *>(
+                 task_allocator_.alloc(static_cast<int64_t>(sizeof(bool)) * task_count)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (task_count > 0) {
+    MEMSET(handled, 0, sizeof(bool) * task_count);
   }
-  for (int64_t i = 0; OB_SUCC(ret) && i < task_queue_.count(); ++i) {
-    const AiTaskRow &task = task_queue_.at(i);
-    ObAIFuncExprInfo *info = NULL;
-    ObString result_str;
-    int call_ret = OB_SUCCESS;
-    share::ObAiModelEndpointInfo endpoint;
-    query::ObIAiEndpointResolver *resolver = share::server_service<query::ObIAiEndpointResolver>();
-    if (OB_ISNULL(resolver) || task.model_name_.empty()) {
-      call_ret = OB_ERR_UNEXPECTED;
-    } else if (OB_SUCCESS != (call_ret = ObAIFuncUtils::get_ai_func_info(
-                                  task_allocator_, task.model_name_, info))) {
-    } else if (OB_SUCCESS != (call_ret = resolver->resolve_by_model_name(
-                                  task.model_name_, task_allocator_, endpoint))) {
-    } else {
-      ObAIFuncModel model(task_allocator_, *info, endpoint);
-      ObString content = task.prompt_;
-      ObString system_prompt = task.system_prompt_;
-      call_ret = model.call_completion_with_system(system_prompt, content, NULL, result_str);
+  struct GroupOutcome {
+    bool ok_;
+    bool is_integer_;
+    ObString value_;
+  };
+  for (int64_t i = 0; OB_SUCC(ret) && i < task_count; ++i) {
+    if (handled[i]) {
+      continue;
     }
-    ObSqlString update_sql;
-    if (OB_SUCCESS == call_ret) {
-      if (OB_FAIL(update_sql.append_fmt("update `%.*s`.`%.*s` set `%.*s` = '",
-                                        task.db_name_.length(), task.db_name_.ptr(),
-                                        task.table_name_.length(), task.table_name_.ptr(),
-                                        task.result_column_.length(), task.result_column_.ptr()))) {
-      } else if (OB_FAIL(ai_column_worker_helper::append_escaped(result_str, update_sql))) {
-      } else if (OB_FAIL(update_sql.append_fmt("' where %.*s and `%.*s` is null",
-                                               task.predicate_.length(), task.predicate_.ptr(),
-                                               task.result_column_.length(),
-                                               task.result_column_.ptr()))) {
+    const AiTaskRow &first = task_queue_.at(i);
+    int64_t members[8];
+    GroupOutcome outcomes[8];
+    int64_t member_count = 0;
+    for (int64_t j = i; j < task_count && member_count < 8; ++j) {
+      if (!handled[j] && task_queue_.at(j).table_id_ == first.table_id_
+          && 0 == task_queue_.at(j).predicate_.compare(first.predicate_)) {
+        members[member_count] = j;
+        outcomes[member_count].ok_ = false;
+        outcomes[member_count].is_integer_ = task_queue_.at(j).is_integer_;
+        outcomes[member_count].value_.reset();
+        ++member_count;
+        handled[j] = true;
       }
-    } else {
-      LOG_INFO("ai column request failed", K(task.table_id_), K(call_ret));
     }
-    if (OB_SUCC(ret) && !update_sql.empty()) {
-      int64_t affected = 0;
-      if (OB_FAIL(proxy->write(update_sql.string(), affected))) {
-        LOG_WARN("failed to write the ai column result", K(ret), K(call_ret));
+    // Claim the whole row before calling the model: an invalidation in between
+    // clears the request column, so the late answer below cannot be written.
+    char token_buf[64];
+    MEMSET(token_buf, 0, sizeof(token_buf));
+    const int64_t token_len = snprintf(token_buf, sizeof(token_buf), "inflight:%ld:%ld",
+                                       first.attempt_, ObTimeUtility::current_time());
+    const ObString token(token_len > 0 ? static_cast<int32_t>(token_len) : 0, token_buf);
+    ObSqlString claim_sql;
+    if (OB_FAIL(claim_sql.append_fmt("update `%.*s`.`%.*s` set ",
+                                     first.db_name_.length(), first.db_name_.ptr(),
+                                     first.table_name_.length(), first.table_name_.ptr()))) {
+      LOG_WARN("failed to build the ai column claim", K(ret));
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < member_count; ++k) {
+      const AiTaskRow &task = task_queue_.at(members[k]);
+      if (OB_FAIL(claim_sql.append_fmt(
+              "%s`%.*s__ai_request` = '%.*s', `%.*s__ai_state` = 1",
+              k == 0 ? "" : ", ",
+              task.result_column_.length(), task.result_column_.ptr(),
+              token.length(), token.ptr(),
+              task.result_column_.length(), task.result_column_.ptr()))) {
+        LOG_WARN("failed to append the ai column claim", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)
+        && OB_FAIL(claim_sql.append_fmt(" where %.*s", first.predicate_.length(),
+                                       first.predicate_.ptr()))) {
+      LOG_WARN("failed to close the ai column claim", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      int64_t claimed = 0;
+      if (OB_FAIL(proxy->write(claim_sql.string(), claimed))) {
+        LOG_WARN("failed to claim the ai column row", K(ret));
+      }
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < member_count; ++k) {
+      const AiTaskRow &task = task_queue_.at(members[k]);
+      ObAIFuncExprInfo *info = NULL;
+      ObString result_str;
+      int call_ret = OB_SUCCESS;
+      share::ObAiModelEndpointInfo endpoint;
+      query::ObIAiEndpointResolver *resolver =
+          share::server_service<query::ObIAiEndpointResolver>();
+      if (OB_ISNULL(resolver) || task.model_name_.empty()) {
+        call_ret = OB_ERR_UNEXPECTED;
+      } else if (OB_SUCCESS != (call_ret = ObAIFuncUtils::get_ai_func_info(
+                                    task_allocator_, task.model_name_, info))) {
+      } else if (OB_SUCCESS != (call_ret = resolver->resolve_by_model_name(
+                                    task.model_name_, task_allocator_, endpoint))) {
       } else {
-        LOG_INFO("ai column result written", K(task.table_id_), K(task.predicate_), K(affected));
+        ObAIFuncModel model(task_allocator_, *info, endpoint);
+        ObString content = task.prompt_;
+        ObString system_prompt = task.system_prompt_;
+        call_ret = model.call_completion_with_system(system_prompt, content, NULL, result_str);
+      }
+      if (OB_SUCCESS == call_ret && !result_str.empty()
+          && OB_SUCCESS == ob_write_string(task_allocator_, result_str, outcomes[k].value_)) {
+        outcomes[k].ok_ = true;
+      } else {
+        LOG_INFO("ai column request failed", K(task.table_id_), K(call_ret), K(k));
+      }
+    }
+    // Publish every column of the row in one statement so readers never observe
+    // a half filled row, and record the retry budget in the request column.
+    ObSqlString update_sql;
+    if (OB_SUCC(ret)
+        && OB_FAIL(update_sql.append_fmt("update `%.*s`.`%.*s` set ",
+                                         first.db_name_.length(), first.db_name_.ptr(),
+                                         first.table_name_.length(),
+                                         first.table_name_.ptr()))) {
+      LOG_WARN("failed to build the ai column update", K(ret));
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < member_count; ++k) {
+      const AiTaskRow &task = task_queue_.at(members[k]);
+      if (OB_FAIL(update_sql.append(0 == k ? "" : ", "))) {
+      } else if (OB_FAIL(update_sql.append_fmt("`%.*s` = ", task.result_column_.length(),
+                                               task.result_column_.ptr()))) {
+      } else if (!outcomes[k].ok_) {
+        if (OB_FAIL(update_sql.append("NULL"))) {
+        }
+      } else if (outcomes[k].is_integer_) {
+        if (OB_FAIL(update_sql.append(outcomes[k].value_))) {
+        }
+      } else if (OB_FAIL(update_sql.append("'"))) {
+      } else if (OB_FAIL(ai_column_worker_helper::append_escaped(outcomes[k].value_,
+                                                                update_sql))) {
+      } else if (OB_FAIL(update_sql.append("'"))) {
+      }
+      if (OB_SUCC(ret) && outcomes[k].ok_) {
+        if (OB_FAIL(update_sql.append_fmt(", `%.*s__ai_request` = NULL, `%.*s__ai_state` = 2",
+                                          task.result_column_.length(),
+                                          task.result_column_.ptr(),
+                                          task.result_column_.length(),
+                                          task.result_column_.ptr()))) {
+        }
+      } else if (OB_SUCC(ret) && task.attempt_ <= task.max_retries_) {
+        if (OB_FAIL(update_sql.append_fmt(", `%.*s__ai_request` = 'retry:%ld', "
+                                          "`%.*s__ai_state` = 3",
+                                          task.result_column_.length(),
+                                          task.result_column_.ptr(),
+                                          task.attempt_,
+                                          task.result_column_.length(),
+                                          task.result_column_.ptr()))) {
+        }
+      } else if (OB_SUCC(ret)) {
+        if (OB_FAIL(update_sql.append_fmt(", `%.*s__ai_request` = 'abandoned', "
+                                          "`%.*s__ai_state` = 4",
+                                          task.result_column_.length(),
+                                          task.result_column_.ptr(),
+                                          task.result_column_.length(),
+                                          task.result_column_.ptr()))) {
+        }
+      }
+    }
+    if (OB_SUCC(ret)
+        && OB_FAIL(update_sql.append_fmt(" where %.*s", first.predicate_.length(),
+                                         first.predicate_.ptr()))) {
+      LOG_WARN("failed to close the ai column update", K(ret));
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < member_count; ++k) {
+      const AiTaskRow &task = task_queue_.at(members[k]);
+      if (OB_FAIL(update_sql.append_fmt(" and ifnull(`%.*s__ai_request`, '') = '%.*s'",
+                                        task.result_column_.length(),
+                                        task.result_column_.ptr(),
+                                        token.length(), token.ptr()))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      int64_t written = 0;
+      if (OB_FAIL(proxy->write(update_sql.string(), written))) {
+        LOG_WARN("failed to write the ai column result", K(ret), K(update_sql));
+      } else {
+        LOG_INFO("ai column row published", K(first.table_id_), K(first.predicate_),
+                 K(member_count), K(written));
       }
     }
   }
@@ -2569,27 +2695,40 @@ int ObServer::ObAiColumnWorkerTask::process_once()
       }
     }
     ObString system_prompt;
+    bool is_integer_type = false;
     if (0 == data_type.case_compare("json")) {
       system_prompt = ObString::make_string("Return exactly one valid JSON value");
     } else if (0 == data_type.case_compare("bigint") || 0 == data_type.case_compare("int")
                || 0 == data_type.case_compare("integer")) {
       system_prompt = ObString::make_string("Return exactly one base-10 integer");
+      is_integer_type = true;
     } else {
       system_prompt = ai_expr;
     }
     LOG_INFO("ai column worker column", K(pk_name), K(data_type), K(system_prompt));
-    if (OB_FAIL(ret) || pk_name.empty()) {
+    char request_buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
+    MEMSET(request_buf, 0, sizeof(request_buf));
+    const int64_t request_len = snprintf(request_buf, sizeof(request_buf), "%.*s__ai_request",
+                                         static_cast<int32_t>(result_len), result_buf);
+    if (OB_FAIL(ret) || pk_name.empty() || request_len <= 0
+        || request_len > OB_MAX_COLUMN_NAME_LENGTH) {
       continue;
     }
     ObSqlString row_sql;
     ObSEArray<ObString, 8> predicates;
+    ObSEArray<int64_t, 8> attempts;
     if (OB_FAIL(row_sql.append_fmt(
-            "select concat('`', '%.*s', '` = ', `%.*s`) as pred from `%.*s`.`%.*s` "
-            "where `%.*s` is null limit 8",
+            "select concat('`', '%.*s', '` = ', `%.*s`) as pred, "
+            "ifnull(`%.*s`, '') as req from `%.*s`.`%.*s` "
+            "where `%.*s` is null and (ifnull(`%.*s`, '') = '' "
+            "or ifnull(`%.*s`, '') like 'retry:%%') limit 8",
             pk_name.length(), pk_name.ptr(), pk_name.length(), pk_name.ptr(),
+            static_cast<int32_t>(request_len), request_buf,
             column.db_name_.length(), column.db_name_.ptr(),
             column.table_name_.length(), column.table_name_.ptr(),
-            result_len, result_buf))) {
+            static_cast<int32_t>(result_len), result_buf,
+            static_cast<int32_t>(request_len), request_buf,
+            static_cast<int32_t>(request_len), request_buf))) {
       LOG_WARN("failed to build the pending row query", K(ret));
     } else {
       SMART_VAR(ObMySQLProxy::MySQLResult, row_result) {
@@ -2600,9 +2739,18 @@ int ObServer::ObAiColumnWorkerTask::process_once()
           while (OB_SUCC(ret) && OB_SUCC(rows->next())) {
             ObString tmp_pred;
             ObString pred;
+            ObString req;
             if (OB_FAIL(rows->get_varchar("pred", tmp_pred))) {
+            } else if (OB_FAIL(rows->get_varchar("req", req))) {
             } else if (OB_FAIL(ob_write_string(allocator, tmp_pred, pred))) {
             } else if (OB_FAIL(predicates.push_back(pred))) {
+            } else {
+              int64_t attempt = 1;
+              if (req.length() > 6 && 0 == strncasecmp(req.ptr(), "retry:", 6)) {
+                attempt = strtol(req.ptr() + 6, NULL, 10) + 1;
+              }
+              if (OB_FAIL(attempts.push_back(attempt))) {
+              }
             }
           }
           if (OB_ITER_END == ret) {
@@ -2644,6 +2792,8 @@ int ObServer::ObAiColumnWorkerTask::process_once()
       AiTaskRow task;
       task.table_id_ = column.table_id_;
       task.max_retries_ = column.max_retries_;
+      task.attempt_ = attempts.at(j);
+      task.is_integer_ = is_integer_type;
       task.prompt_ = prompt;
       task.predicate_ = predicate;
       task.system_prompt_ = system_prompt;
