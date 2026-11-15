@@ -1828,6 +1828,23 @@ int ObDMLResolver::resolve_basic_column_ref(const ObQualifiedName &q_name, ObRaw
   return ret;
 }
 
+// the ai worker runs on an inner session and has to read and write the hidden
+// companion columns (<col>__ai_state / __ai_request / __ai_result_spec)
+static bool is_ai_companion_column(const ObString &column_name)
+{
+  static const char *const suffixes[] = {"__ai_state", "__ai_request", "__ai_result_spec"};
+  bool is_ai_column = false;
+  for (int64_t i = 0; !is_ai_column && i < static_cast<int64_t>(ARRAYSIZEOF(suffixes)); ++i) {
+    const int64_t suffix_len = static_cast<int64_t>(strlen(suffixes[i]));
+    if (column_name.length() > suffix_len) {
+      is_ai_column = 0 == ObString(static_cast<int32_t>(suffix_len),
+                                   column_name.ptr() + column_name.length() - suffix_len)
+                              .case_compare(suffixes[i]);
+    }
+  }
+  return is_ai_column;
+}
+
 int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
                                              const ObString &column_name,
                                              bool include_hidden,
@@ -1840,6 +1857,10 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
   ColumnItem column_item;
   if (NULL == stmt) {
     stmt = get_stmt();
+  }
+  if (!include_hidden && NULL != session_info_ && session_info_->is_inner()
+      && is_ai_companion_column(column_name)) {
+    include_hidden = true;
   }
   if (OB_ISNULL(stmt)
       || OB_ISNULL(schema_checker_)
@@ -4292,19 +4313,38 @@ int ObDMLResolver::expand_ai_column_task_table(TableItem &task_item)
               }
             }
             if (OB_SUCC(ret)) {
+              // the worker records its progress in the hidden request column:
+              //   null        -> pending
+              //   'retry:<n>' -> the last attempt failed n times
+              //   'abandoned' -> no attempt will be made again
               const ObString &table_name = table->get_table_name_str();
-              if (OB_FAIL(sql.append_fmt(
+              char request_name_buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
+              MEMSET(request_name_buf, 0, sizeof(request_name_buf));
+              const int64_t request_name_len = snprintf(request_name_buf, sizeof(request_name_buf),
+                                                        "%.*s__ai_request",
+                                                        ai_name.length(), ai_name.ptr());
+              if (request_name_len <= 0 || request_name_len > OB_MAX_COLUMN_NAME_LENGTH) {
+                ret = OB_ERR_UNEXPECTED;
+                LOG_WARN("ai request column name is too long", K(ret), K(ai_name));
+              } else if (OB_FAIL(sql.append_fmt(
                       "%sselect %lu as table_id, %lu as column_id, %.*s as request_id, "
-                      "%.*s as rowkey_predicate, 0 as state, 0 as retry_count, now(6) as eligible_ts "
-                      "from `%.*s`.`%.*s` where (%.*s is null or %.*s = 0)",
+                      "%.*s as rowkey_predicate, "
+                      "case when (%.*s like 'retry:%%') then 3 else 0 end as state, "
+                      "case when (%.*s like 'retry:%%') then cast(substring(%.*s, 7) as unsigned) "
+                      "else 0 end as retry_count, now(6) as eligible_ts from `%.*s`.`%.*s` "
+                      "where %.*s is null and (%.*s is null or %.*s like 'retry:%%')",
                       first ? "" : " union all ",
                       table->get_table_id(), result_column->get_column_id(),
                       static_cast<int>(pred.length()), pred.ptr(),
                       static_cast<int>(pred.length()), pred.ptr(),
+                      static_cast<int>(request_name_len), request_name_buf,
+                      static_cast<int>(request_name_len), request_name_buf,
+                      static_cast<int>(request_name_len), request_name_buf,
                       db_name.length(), db_name.ptr(),
                       table_name.length(), table_name.ptr(),
-                      state_name.length(), state_name.ptr(),
-                      state_name.length(), state_name.ptr()))) {
+                      ai_name.length(), ai_name.ptr(),
+                      static_cast<int>(request_name_len), request_name_buf,
+                      static_cast<int>(request_name_len), request_name_buf))) {
                 LOG_WARN("failed to build the derived task select", K(ret));
               } else {
                 first = false;
