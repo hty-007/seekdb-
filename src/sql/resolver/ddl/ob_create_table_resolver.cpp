@@ -2351,16 +2351,59 @@ int ObCreateTableResolver::uk_or_heap_table_pk_add_to_index_list(ObArray<int> &i
 }
 }//end namespace sql
 
+
+static bool expr_refers_to_ai_column(const ParseNode *node, const ObIArray<ObString> &ai_names)
+{
+  bool found = false;
+  if (NULL == node) {
+    // nothing to do
+  } else if (T_IDENT == node->type_ && NULL != node->str_value_) {
+    ObString name(static_cast<int32_t>(node->str_len_), node->str_value_);
+    for (int64_t i = 0; !found && i < ai_names.count(); ++i) {
+      found = (ai_names.at(i) == name);
+    }
+  } else if (NULL != node->children_) {
+    for (int32_t i = 0; !found && i < node->num_child_; ++i) {
+      found = expr_refers_to_ai_column(node->children_[i], ai_names);
+    }
+  }
+  return found;
+}
+
 int ObCreateTableResolver::add_ai_column_hidden_columns(const ParseNode *node,
                                                        ObTableSchema &table_schema)
 {
   int ret = OB_SUCCESS;
+  ObSEArray<ObString, 4> ai_names;
   if (OB_ISNULL(node) || OB_ISNULL(node->children_)) {
     ret = OB_INVALID_ARGUMENT;
     SQL_RESV_LOG(WARN, "invalid argument", K(ret));
   }
+  // names of every ai column of this table, used to reject ai columns referring to each other
   for (int32_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
     ParseNode *element = node->children_[i];
+    if (NULL == element || T_COLUMN_DEFINITION != element->type_
+        || NULL == element->children_ || element->num_child_ < 3) {
+      continue;
+    }
+    ParseNode *attrs = element->children_[2];
+    ParseNode *name_node = element->children_[0];
+    if (NULL == attrs || T_COLUMN_ATTRIBUTES != attrs->type_ || NULL == attrs->children_
+        || NULL == name_node || NULL == name_node->str_value_) {
+      continue;
+    }
+    for (int32_t j = 0; OB_SUCC(ret) && j < attrs->num_child_; ++j) {
+      if (NULL != attrs->children_[j] && T_CONSTR_AI_COLUMN == attrs->children_[j]->type_) {
+        ObString ai_name(static_cast<int32_t>(name_node->str_len_), name_node->str_value_);
+        if (OB_FAIL(ai_names.push_back(ai_name))) {
+          SQL_RESV_LOG(WARN, "failed to record ai column name", K(ret));
+        }
+      }
+    }
+  }
+  for (int32_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+    ParseNode *element = node->children_[i];
+    ParseNode *ai_attr = NULL;
     if (OB_ISNULL(element)) {
       ret = OB_ERR_UNEXPECTED;
       SQL_RESV_LOG(WARN, "element is null", K(ret), K(i));
@@ -2377,8 +2420,19 @@ int ObCreateTableResolver::add_ai_column_hidden_columns(const ParseNode *node,
         for (int32_t j = 0; !is_ai_column && j < attrs->num_child_; ++j) {
           if (NULL != attrs->children_[j] && T_CONSTR_AI_COLUMN == attrs->children_[j]->type_) {
             is_ai_column = true;
+            ai_attr = attrs->children_[j];
           }
         }
+      }
+      if (is_ai_column && NULL != ai_attr
+          && (OB_ISNULL(ai_attr->children_) || ai_attr->num_child_ < 1)) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "ai column attribute has no expression", K(ret));
+      } else if (is_ai_column && NULL != ai_attr
+                 && expr_refers_to_ai_column(ai_attr->children_[0], ai_names)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "reference to another ai column");
+        SQL_RESV_LOG(WARN, "an ai column can not depend on another ai column", K(ret));
       }
       if (!is_ai_column) {
         // ordinary column
