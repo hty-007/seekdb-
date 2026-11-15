@@ -6171,6 +6171,9 @@ column_attribute_list column_attribute
 column_attribute:
 AI COLUMN '(' expr ')' opt_ai_column_with
 {
+  /* keep the original text of the model expression: the physical ddl persists
+   * it so the asynchronous worker can rebuild the model request later. */
+  dup_expr_string($4, result, @4.first_column, @4.last_column);
   malloc_non_terminal_node($$, result->malloc_pool_, T_CONSTR_AI_COLUMN, 2, $4, $6);
 }
 | not NULLX

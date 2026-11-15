@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX RS
 #include "rootserver/parallel_ddl/ob_create_table_helper.h"
+#include "share/inner_table/ob_inner_table_schema.h"
+#include "share/ob_dml_sql_splicer.h"
 #include "rootserver/ob_index_builder.h"
 #include "rootserver/ob_lob_meta_builder.h"
 #include "rootserver/ob_lob_piece_builder.h"
@@ -863,6 +865,189 @@ int ObCreateTableHelper::operate_schemas_() {
   if (OB_FAIL(check_inner_stat_())) {
   } else if (OB_FAIL(inner_create_table_(&arg_.ddl_stmt_str_,
                                          replace_mock_fk_parent_table_id_))) {
+  } else if (OB_FAIL(insert_ai_column_metadata_())) {
+  }
+  return ret;
+}
+
+namespace {
+
+const char *AI_COLUMN_STATE_SUFFIX = "__ai_state";
+
+bool ob_str_ends_with(const ObString &str, const char *suffix)
+{
+  const int64_t suffix_len = static_cast<int64_t>(strlen(suffix));
+  return str.length() >= suffix_len
+         && 0 == MEMCMP(str.ptr() + str.length() - suffix_len, suffix, suffix_len);
+}
+
+// the spec is stored as "<key>=<value>" lines separated by '\n'
+void get_ai_spec_value(const ObString &spec, const char *key, ObString &value)
+{
+  value.reset();
+  const int64_t key_len = static_cast<int64_t>(strlen(key));
+  int64_t pos = 0;
+  while (pos < spec.length() && value.empty()) {
+    int64_t line_end = pos;
+    while (line_end < spec.length() && '\n' != spec.ptr()[line_end]) {
+      ++line_end;
+    }
+    const int64_t line_len = line_end - pos;
+    if (line_len > key_len && 0 == MEMCMP(spec.ptr() + pos, key, key_len)
+        && '=' == spec.ptr()[pos + key_len]) {
+      value.assign_ptr(spec.ptr() + pos + key_len + 1,
+                       static_cast<int32_t>(line_len - key_len - 1));
+    }
+    pos = line_end + 1;
+  }
+}
+
+// typed system prompt that makes the model answer with the column type
+void get_ai_column_result_spec(const ObColumnSchemaV2 &column, ObString &spec)
+{
+  spec.reset();
+  const ObObjType type = column.get_data_type();
+  if (ObJsonType == type) {
+    spec = ObString::make_string("Return exactly one valid JSON value");
+  } else if (ob_is_integer_type(type)) {
+    spec = ObString::make_string("Return exactly one base-10 integer");
+  }
+}
+
+int get_ai_column_ids(const ObTableSchema &table,
+                      const ObString &ai_name,
+                      uint64_t &column_id,
+                      uint64_t &state_column_id,
+                      uint64_t &request_column_id,
+                      uint64_t &result_spec_column_id,
+                      ObString &spec_comment,
+                      ObString &result_type_spec)
+{
+  int ret = OB_SUCCESS;
+  char buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
+  const ObColumnSchemaV2 *result_column = NULL;
+  const char *suffix[3] = {"__ai_state", "__ai_request", "__ai_result_spec"};
+  const ObColumnSchemaV2 *columns[3] = {NULL, NULL, NULL};
+  result_column = table.get_column_schema(ai_name);
+  if (OB_ISNULL(result_column)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the ai column is missing from the table schema", K(ret), K(ai_name));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+    int64_t len = snprintf(buf, sizeof(buf), "%.*s%s",
+                           ai_name.length(), ai_name.ptr(), suffix[i]);
+    if (OB_UNLIKELY(len <= 0 || len > OB_MAX_COLUMN_NAME_LENGTH)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      columns[i] = table.get_column_schema(ObString(static_cast<int32_t>(len), buf));
+      if (OB_ISNULL(columns[i])) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("the hidden ai column is missing from the table schema", K(ret), K(i));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    column_id = result_column->get_column_id();
+    state_column_id = columns[0]->get_column_id();
+    request_column_id = columns[1]->get_column_id();
+    result_spec_column_id = columns[2]->get_column_id();
+    spec_comment = columns[2]->get_comment_str();
+    get_ai_column_result_spec(*result_column, result_type_spec);
+  }
+  return ret;
+}
+
+} // namespace
+
+int ObCreateTableHelper::insert_ai_column_metadata_of_table_(
+    const share::schema::ObTableSchema &table)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < table.get_column_count(); ++i) {
+    const ObColumnSchemaV2 *column = table.get_column_schema_by_idx(i);
+    ObString ai_name;
+    if (NULL == column || !column->is_hidden()) {
+      continue;
+    } else if (!ob_str_ends_with(column->get_column_name_str(), AI_COLUMN_STATE_SUFFIX)) {
+      continue;
+    } else {
+      const ObString &col_name = column->get_column_name_str();
+      ai_name.assign_ptr(col_name.ptr(),
+                         static_cast<int32_t>(col_name.length()
+                             - static_cast<int64_t>(strlen(AI_COLUMN_STATE_SUFFIX))));
+    }
+    uint64_t column_id = OB_INVALID_ID;
+    uint64_t state_column_id = OB_INVALID_ID;
+    uint64_t request_column_id = OB_INVALID_ID;
+    uint64_t result_spec_column_id = OB_INVALID_ID;
+    ObString spec_comment;
+    ObString result_type_spec;
+    ObString ai_expr;
+    ObString sync_mode;
+    ObString retries_str;
+    int64_t max_retries = 0;
+    if (OB_FAIL(get_ai_column_ids(table, ai_name, column_id, state_column_id,
+                                  request_column_id, result_spec_column_id,
+                                  spec_comment, result_type_spec))) {
+      LOG_WARN("failed to collect the ai column ids", K(ret), K(ai_name));
+    } else {
+      get_ai_spec_value(spec_comment, "ai_expr", ai_expr);
+      get_ai_spec_value(spec_comment, "sync_mode", sync_mode);
+      get_ai_spec_value(spec_comment, "max_retries", retries_str);
+      if (!retries_str.empty()) {
+        max_retries = atoi(retries_str.ptr());
+      }
+      if (sync_mode.empty()) {
+        sync_mode = ObString::make_string("async");
+      }
+      ObSqlString normalized_expr;
+      if (OB_FAIL(normalized_expr.append_fmt("%.*s\n%.*s",
+                                             ai_expr.length(),
+                                             NULL == ai_expr.ptr() ? "" : ai_expr.ptr(),
+                                             result_type_spec.length(),
+                                             NULL == result_type_spec.ptr()
+                                                 ? "" : result_type_spec.ptr()))) {
+        LOG_WARN("failed to build the normalized ai expression", K(ret));
+      } else {
+        ObDMLSqlSplicer sql;
+        ObSqlString buffer;
+        int64_t affected_rows = 0;
+        if (OB_FAIL(sql.add_pk_column("table_id", table.get_table_id()))) {
+        } else if (OB_FAIL(sql.add_pk_column("column_id", column_id))) {
+        } else if (OB_FAIL(sql.add_column("column_name", ObHexEscapeSqlStr(ai_name)))) {
+        } else if (OB_FAIL(sql.add_column("state_column_id",
+                                          static_cast<int64_t>(state_column_id)))) {
+        } else if (OB_FAIL(sql.add_column("request_column_id",
+                                          static_cast<int64_t>(request_column_id)))) {
+        } else if (OB_FAIL(sql.add_column("result_spec_column_id",
+                                          static_cast<int64_t>(result_spec_column_id)))) {
+        } else if (OB_FAIL(sql.add_column("sync_mode", ObHexEscapeSqlStr(sync_mode)))) {
+        } else if (OB_FAIL(sql.add_column("max_retries", max_retries))) {
+        } else if (OB_FAIL(sql.add_column("normalized_expr",
+                                          ObHexEscapeSqlStr(normalized_expr.string())))) {
+        } else if (OB_FAIL(sql.splice_insert_sql(OB_ALL_AI_COLUMN_TNAME, buffer))) {
+        } else if (OB_FAIL(get_trans_().write(buffer.ptr(), affected_rows))) {
+        } else if (!is_single_row(affected_rows)) {
+          ret = OB_ERR_UNEXPECTED;
+        }
+        if (OB_FAIL(ret)) {
+          LOG_WARN("failed to write the ai column metadata", K(ret),
+                   K(table.get_table_name()), K(ai_name));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObCreateTableHelper::insert_ai_column_metadata_()
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < new_tables_.count(); ++i) {
+    if (OB_FAIL(insert_ai_column_metadata_of_table_(new_tables_.at(i)))) {
+      LOG_WARN("failed to insert the ai column metadata", K(ret),
+               K(new_tables_.at(i).get_table_id()));
+    }
   }
   return ret;
 }

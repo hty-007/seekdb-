@@ -2370,6 +2370,173 @@ static bool expr_refers_to_ai_column(const ParseNode *node, const ObIArray<ObStr
   return found;
 }
 
+
+// <column> <type> AI COLUMN (<expr>) [WITH (sync_mode = '...', max_retries = N)]
+// The model expression and the scheduling options are persisted in the comment of
+// the hidden result-spec column, so the asynchronous worker can rebuild the model
+// request without changing the serialized table schema.
+static const char *AI_COLUMN_STATE_SUFFIX = "__ai_state";
+static const char *AI_COLUMN_REQUEST_SUFFIX = "__ai_request";
+static const char *AI_COLUMN_RESULT_SPEC_SUFFIX = "__ai_result_spec";
+
+static int64_t build_ai_column_spec(const ParseNode &attr, char *buf, int64_t buf_len)
+{
+  int64_t ret_len = 0;
+  const ParseNode *expr = (NULL != attr.children_ && attr.num_child_ > 0)
+                              ? attr.children_[0] : NULL;
+  const char *expr_ptr = "";
+  int32_t expr_len = 0;
+  const char *sync_mode = "async";
+  int32_t sync_len = 5;
+  int64_t max_retries = 0;
+  if (NULL != expr && NULL != expr->str_value_ && expr->str_len_ > 0) {
+    expr_ptr = expr->str_value_;
+    expr_len = static_cast<int32_t>(expr->str_len_);
+  }
+  const ParseNode *opts = (NULL != attr.children_ && attr.num_child_ > 1)
+                              ? attr.children_[1] : NULL;
+  for (const ParseNode *cur = opts; NULL != cur; ) {
+    const ParseNode *item = NULL;
+    if (T_LINK_NODE == cur->type_ && NULL != cur->children_ && cur->num_child_ >= 2) {
+      item = cur->children_[1];
+      cur = cur->children_[0];
+    } else {
+      item = cur;
+      cur = NULL;
+    }
+    if (NULL == item || T_AI_COLUMN_OPTION != item->type_ || NULL == item->children_
+        || item->num_child_ < 1 || NULL == item->str_value_) {
+      continue;
+    }
+    ObString opt_name(static_cast<int32_t>(item->str_len_), item->str_value_);
+    const ParseNode *value = item->children_[0];
+    if (NULL == value) {
+      continue;
+    } else if (0 == opt_name.case_compare("sync_mode") && T_VARCHAR == value->type_
+               && NULL != value->str_value_ && value->str_len_ > 0) {
+      sync_mode = value->str_value_;
+      sync_len = static_cast<int32_t>(value->str_len_);
+    } else if (0 == opt_name.case_compare("max_retries")
+               && (T_INT == value->type_ || T_NUMBER == value->type_)) {
+      max_retries = value->value_;
+    }
+  }
+  if (buf_len > 0) {
+    int64_t len = snprintf(buf, static_cast<size_t>(buf_len),
+                           "ai_expr=%.*s\nsync_mode=%.*s\nmax_retries=%ld",
+                           expr_len, expr_ptr, sync_len, sync_mode, max_retries);
+    if (len > 0 && len < buf_len) {
+      ret_len = len;
+    }
+  }
+  return ret_len;
+}
+
+// ai_embed('<model>', <prompt>, <dim>) returns the requested dimension, or -1.
+static int64_t ai_embed_requested_dim(const ObString &expr)
+{
+  int64_t dim = -1;
+  const char *p = expr.ptr();
+  const int64_t n = expr.length();
+  const char *fn = "ai_embed";
+  const int64_t fn_len = 8;
+  int64_t i = 0;
+  bool matched = true;
+  while (i < n && isspace(static_cast<unsigned char>(p[i]))) { ++i; }
+  for (int64_t k = 0; matched && k < fn_len; ++k) {
+    matched = (i + k < n)
+              && tolower(static_cast<unsigned char>(p[i + k])) == fn[k];
+  }
+  if (!matched) {
+    return -1;
+  } else {
+    i += fn_len;
+    while (i < n && isspace(static_cast<unsigned char>(p[i]))) { ++i; }
+    if (i >= n || '(' != p[i]) {
+      return -1;
+    }
+    ++i;
+    int64_t depth = 0;
+    int64_t arg_idx = 1;
+    int64_t arg_start = i;
+    int64_t last_start = -1;
+    bool closed = false;
+    char quote = 0;
+    for (; i < n && !closed; ++i) {
+      char c = p[i];
+      if (0 != quote) {
+        if ('\\' == c) {
+          ++i;
+        } else if (c == quote) {
+          quote = 0;
+        }
+      } else if ('\'' == c || '"' == c) {
+        quote = c;
+      } else if ('(' == c || '[' == c) {
+        ++depth;
+      } else if (')' == c || ']' == c) {
+        if (0 == depth) {
+          last_start = arg_start;
+          closed = true;
+        } else {
+          --depth;
+        }
+      } else if (',' == c && 0 == depth) {
+        ++arg_idx;
+        arg_start = i + 1;
+      }
+    }
+    if (!closed || 3 != arg_idx || last_start < 0) {
+      return -1;
+    } else {
+      int64_t s = last_start;
+      int64_t e = i - 1;
+      while (s < e && isspace(static_cast<unsigned char>(p[s]))) { ++s; }
+      while (e > s && isspace(static_cast<unsigned char>(p[e - 1]))) { --e; }
+      int64_t value = 0;
+      bool digits = (s < e);
+      for (int64_t k = s; digits && k < e; ++k) {
+        if (p[k] < '0' || p[k] > '9') {
+          digits = false;
+        } else {
+          value = value * 10 + (p[k] - '0');
+          digits = (value <= 1000000);
+        }
+      }
+      if (digits) {
+        dim = value;
+      }
+    }
+  }
+  return dim;
+}
+
+static int check_ai_column_definition(const ParseNode *type_node, const ParseNode &attr)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *expr = (NULL != attr.children_ && attr.num_child_ > 0)
+                              ? attr.children_[0] : NULL;
+  int64_t declared_dim = -1;
+  if (NULL != type_node && T_COLLECTION == type_node->type_
+      && 1 == type_node->int32_values_[0] && NULL != type_node->children_
+      && type_node->num_child_ > 0 && NULL != type_node->children_[0]) {
+    declared_dim = type_node->children_[0]->value_;
+  }
+  if (declared_dim > 0 && NULL != expr && NULL != expr->str_value_ && expr->str_len_ > 0) {
+    ObString expr_text(static_cast<int32_t>(expr->str_len_), expr->str_value_);
+    int64_t requested = ai_embed_requested_dim(expr_text);
+    if (requested > 0 && requested != declared_dim) {
+      ret = OB_ERR_INVALID_VECTOR_DIM;
+      LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM,
+                     static_cast<uint32_t>(declared_dim),
+                     static_cast<uint32_t>(requested));
+      SQL_RESV_LOG(WARN, "ai embed dimension does not match the vector column",
+                   K(ret), K(declared_dim), K(requested));
+    }
+  }
+  return ret;
+}
+
 int ObCreateTableResolver::add_ai_column_hidden_columns(const ParseNode *node,
                                                        ObTableSchema &table_schema)
 {
@@ -2434,6 +2601,10 @@ int ObCreateTableResolver::add_ai_column_hidden_columns(const ParseNode *node,
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "reference to another ai column");
         SQL_RESV_LOG(WARN, "an ai column can not depend on another ai column", K(ret));
       }
+      if (is_ai_column && OB_SUCC(ret) && NULL != ai_attr
+          && OB_FAIL(check_ai_column_definition(element->children_[1], *ai_attr))) {
+        SQL_RESV_LOG(WARN, "invalid ai column definition", K(ret));
+      }
       if (!is_ai_column) {
         // ordinary column
       } else if (OB_ISNULL(name_node) || OB_ISNULL(name_node->str_value_)
@@ -2441,7 +2612,14 @@ int ObCreateTableResolver::add_ai_column_hidden_columns(const ParseNode *node,
         ret = OB_ERR_UNEXPECTED;
         SQL_RESV_LOG(WARN, "ai column name is invalid", K(ret));
       } else {
-        static const char *suffix[3] = {"__ai_state", "__ai_request", "__ai_result_spec"};
+        static const char *suffix[3] = {AI_COLUMN_STATE_SUFFIX, AI_COLUMN_REQUEST_SUFFIX,
+                                       AI_COLUMN_RESULT_SPEC_SUFFIX};
+        char ai_spec_buf[4096];
+        int64_t ai_spec_len = 0;
+        MEMSET(ai_spec_buf, 0, sizeof(ai_spec_buf));
+        if (NULL != ai_attr) {
+          ai_spec_len = build_ai_column_spec(*ai_attr, ai_spec_buf, sizeof(ai_spec_buf));
+        }
         for (int64_t k = 0; OB_SUCC(ret) && k < 3; ++k) {
           char name_buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
           int64_t name_len = snprintf(name_buf, sizeof(name_buf), "%.*s%s",
@@ -2464,7 +2642,12 @@ int ObCreateTableResolver::add_ai_column_hidden_columns(const ParseNode *node,
               hidden_column.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
               hidden_column.set_charset_type(CHARSET_UTF8MB4);
             }
-            if (OB_FAIL(table_schema.add_column(hidden_column))) {
+            if (OB_FAIL(ret)) {
+            } else if (2 == k && ai_spec_len > 0
+                       && OB_FAIL(hidden_column.set_comment(
+                              ObString(static_cast<int32_t>(ai_spec_len), ai_spec_buf)))) {
+              SQL_RESV_LOG(WARN, "failed to set the ai column spec", K(ret));
+            } else if (OB_FAIL(table_schema.add_column(hidden_column))) {
               SQL_RESV_LOG(WARN, "failed to add hidden column", K(ret), K(k));
             }
           }

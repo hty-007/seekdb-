@@ -20,6 +20,8 @@
 #include "share/config/ob_config_helper.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "ob_local_management_service.h"
+#include "share/inner_table/ob_inner_table_schema.h"
+#include "share/ob_dml_sql_splicer.h"
 #include "data_plane/ddl/ob_ddl_coordinator.h"
 #include "data_plane/ddl/ob_ddl_schedule.h"
 #include "query/command/ob_local_command_service.h"
@@ -983,6 +985,108 @@ int ObLocalManagementService::set_comment(const obcall::ObSetCommentArg &arg, ob
   return ret;
 }
 
+namespace {
+
+void get_ai_spec_field(const ObString &spec, const char *key, ObString &value)
+{
+  value.reset();
+  const int64_t key_len = static_cast<int64_t>(strlen(key));
+  int64_t pos = 0;
+  while (pos < spec.length() && value.empty()) {
+    int64_t line_end = pos;
+    while (line_end < spec.length() && '\n' != spec.ptr()[line_end]) {
+      ++line_end;
+    }
+    const int64_t line_len = line_end - pos;
+    if (line_len > key_len && 0 == MEMCMP(spec.ptr() + pos, key, key_len)
+        && '=' == spec.ptr()[pos + key_len]) {
+      value.assign_ptr(spec.ptr() + pos + key_len + 1,
+                       static_cast<int32_t>(line_len - key_len - 1));
+    }
+    pos = line_end + 1;
+  }
+}
+
+int write_ai_column_metadata(common::ObISQLClient &client,
+                             const share::schema::ObTableSchema &table,
+                             const share::schema::ObColumnSchemaV2 &column)
+{
+  int ret = OB_SUCCESS;
+  const ObString &spec = column.get_comment_str();
+  ObString ai_expr;
+  ObString sync_mode;
+  ObString retries_str;
+  get_ai_spec_field(spec, "ai_expr", ai_expr);
+  get_ai_spec_field(spec, "sync_mode", sync_mode);
+  get_ai_spec_field(spec, "max_retries", retries_str);
+  if (ai_expr.empty()) {
+    // not an ai column
+  } else {
+    const int64_t max_retries = retries_str.empty() ? 0 : atoi(retries_str.ptr());
+    ObString result_spec;
+    const ObObjType type = column.get_data_type();
+    if (ObJsonType == type) {
+      result_spec = ObString::make_string("Return exactly one valid JSON value");
+    } else if (ob_is_integer_type(type)) {
+      result_spec = ObString::make_string("Return exactly one base-10 integer");
+    }
+    ObSqlString normalized_expr;
+    if (OB_FAIL(normalized_expr.append_fmt("%.*s\n%.*s",
+                                           ai_expr.length(), ai_expr.ptr(),
+                                           result_spec.length(),
+                                           NULL == result_spec.ptr() ? "" : result_spec.ptr()))) {
+    } else {
+      share::ObDMLSqlSplicer sql;
+      ObSqlString buffer;
+      int64_t affected_rows = 0;
+      if (OB_FAIL(sql.add_pk_column("table_id", table.get_table_id()))) {
+      } else if (OB_FAIL(sql.add_pk_column("column_id", column.get_column_id()))) {
+      } else if (OB_FAIL(sql.add_column("column_name",
+                                        ObHexEscapeSqlStr(column.get_column_name_str())))) {
+      } else if (OB_FAIL(sql.add_column("state_column_id", 0))) {
+      } else if (OB_FAIL(sql.add_column("request_column_id", 0))) {
+      } else if (OB_FAIL(sql.add_column("result_spec_column_id", 0))) {
+      } else if (OB_FAIL(sql.add_column("sync_mode", ObHexEscapeSqlStr(sync_mode)))) {
+      } else if (OB_FAIL(sql.add_column("max_retries", max_retries))) {
+      } else if (OB_FAIL(sql.add_column("normalized_expr",
+                                        ObHexEscapeSqlStr(normalized_expr.string())))) {
+      } else if (OB_FAIL(sql.splice_insert_sql(OB_ALL_AI_COLUMN_TNAME, buffer))) {
+      } else if (OB_FAIL(client.write(buffer.ptr(), affected_rows))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int insert_ai_column_metadata_after_alter(share::schema::ObSchemaGetterGuard &guard,
+                                          const share::schema::ObTableSchema &alter_schema,
+                                          common::ObISQLClient &client)
+{
+  int ret = OB_SUCCESS;
+  const share::schema::ObTableSchema *table = NULL;
+  const uint64_t table_id = alter_schema.get_table_id();
+  if (OB_INVALID_ID == table_id) {
+    // not an alter table statement
+  } else if (OB_FAIL(guard.get_table_schema(table_id, table)) || NULL == table) {
+    ret = OB_TABLE_NOT_EXIST;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < alter_schema.get_column_count(); ++i) {
+      const share::schema::ObColumnSchemaV2 *added = alter_schema.get_column_schema_by_idx(i);
+      const share::schema::ObColumnSchemaV2 *actual = NULL;
+      if (NULL == added || added->get_comment_str().empty()) {
+        continue;
+      } else if (NULL == (actual = table->get_column_schema(added->get_column_name_str()))) {
+        continue;
+      } else if (OB_FAIL(write_ai_column_metadata(client, *table, *actual))) {
+        LOG_WARN("failed to write the ai column metadata", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+} // namespace
+
 int ObLocalManagementService::alter_table(const obcall::ObAlterTableArg &arg, obcall::ObAlterTableRes &res)
 {
   int ret = OB_SUCCESS;
@@ -1054,8 +1158,10 @@ int ObLocalManagementService::alter_table(const obcall::ObAlterTableArg &arg, ob
       } else if (OB_FAIL(schema_guard.get_simple_table_schema(arg.alter_table_schema_.get_table_id(), simple_table_schema))) {
       } else if (OB_ISNULL(simple_table_schema)) {
         ret = OB_ERR_UNEXPECTED;
-      } else {
-        res.schema_version_ = simple_table_schema->get_schema_version();
+      } else if (FALSE_IT(res.schema_version_ = simple_table_schema->get_schema_version())) {
+      } else if (OB_FAIL(insert_ai_column_metadata_after_alter(
+                   schema_guard, arg.alter_table_schema_, sql_proxy_))) {
+        LOG_WARN("failed to insert the ai column metadata", K(ret));
       }
     }
   }

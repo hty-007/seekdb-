@@ -106,6 +106,8 @@ private:
   // new table schema for data/index/lob tables
   common::hash::ObHashMap<MockFKParentTableNameWrapper, share::schema::ObMockFKParentTableSchema*> new_mock_fk_parent_table_map_;
 private:
+  int insert_ai_column_metadata_();
+  int insert_ai_column_metadata_of_table_(const share::schema::ObTableSchema &table);
   DISALLOW_COPY_AND_ASSIGN(ObCreateTableHelper);
 };
 

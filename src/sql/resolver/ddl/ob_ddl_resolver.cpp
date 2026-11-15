@@ -2056,6 +2056,61 @@ int ObDDLResolver::resolve_normal_column_attribute_constr_default(ObColumnSchema
 
 
 
+
+// AI COLUMN: the model expression text is kept in the column comment so that
+// ALTER TABLE ... ADD COLUMN can register the same metadata row as CREATE TABLE.
+static int set_ai_column_spec_comment(ObColumnSchemaV2 &column, const ParseNode &attr)
+{
+  int ret = OB_SUCCESS;
+  char buf[4096];
+  const ParseNode *expr = (NULL != attr.children_ && attr.num_child_ > 0)
+                              ? attr.children_[0] : NULL;
+  const char *expr_ptr = "";
+  int32_t expr_len = 0;
+  const char *sync_mode = "async";
+  int32_t sync_len = 5;
+  int64_t max_retries = 0;
+  if (NULL != expr && NULL != expr->str_value_ && expr->str_len_ > 0) {
+    expr_ptr = expr->str_value_;
+    expr_len = static_cast<int32_t>(expr->str_len_);
+  }
+  const ParseNode *opts = (NULL != attr.children_ && attr.num_child_ > 1)
+                              ? attr.children_[1] : NULL;
+  for (const ParseNode *cur = opts; NULL != cur; ) {
+    const ParseNode *item = NULL;
+    if (T_LINK_NODE == cur->type_ && NULL != cur->children_ && cur->num_child_ >= 2) {
+      item = cur->children_[1];
+      cur = cur->children_[0];
+    } else {
+      item = cur;
+      cur = NULL;
+    }
+    if (NULL == item || T_AI_COLUMN_OPTION != item->type_ || NULL == item->children_
+        || item->num_child_ < 1 || NULL == item->str_value_) {
+      continue;
+    }
+    ObString opt_name(static_cast<int32_t>(item->str_len_), item->str_value_);
+    const ParseNode *value = item->children_[0];
+    if (NULL == value) {
+      continue;
+    } else if (0 == opt_name.case_compare("sync_mode") && T_VARCHAR == value->type_
+               && NULL != value->str_value_ && value->str_len_ > 0) {
+      sync_mode = value->str_value_;
+      sync_len = static_cast<int32_t>(value->str_len_);
+    } else if (0 == opt_name.case_compare("max_retries")
+               && (T_INT == value->type_ || T_NUMBER == value->type_)) {
+      max_retries = value->value_;
+    }
+  }
+  int64_t len = snprintf(buf, sizeof(buf), "ai_expr=%.*s\nsync_mode=%.*s\nmax_retries=%ld",
+                         expr_len, expr_ptr, sync_len, sync_mode, max_retries);
+  if (len > 0 && len < static_cast<int64_t>(sizeof(buf))
+      && column.get_comment_str().empty()) {
+    ret = column.set_comment(ObString(static_cast<int32_t>(len), buf));
+  }
+  return ret;
+}
+
 int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
                                                    ParseNode *attrs_node,
                                                    ObColumnResolveStat &resolve_stat,
@@ -2288,9 +2343,14 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       }
       case T_CONSTR_AI_COLUMN: {
         // <column> <type> AI COLUMN '(' expr ')' [WITH (...)]
-        // The AI expression node ($1) and the option list ($2) are not consumed yet:
-        // wiring the hidden state/request/result-spec columns and the __all_ai_column
-        // metadata is the next step.
+        // CREATE TABLE materializes the hidden companions in ObCreateTableResolver,
+        // for ALTER TABLE ADD COLUMN the expression is carried in the column comment
+        // so that the alter table ddl can register the metadata row afterwards.
+        if (stmt::T_ALTER_TABLE == stmt_->get_stmt_type()) {
+          if (OB_FAIL(set_ai_column_spec_comment(column, *attr_node))) {
+            SQL_RESV_LOG(WARN, "failed to set the ai column spec", K(ret));
+          }
+        }
         break;
       }
       default:  // won't be here

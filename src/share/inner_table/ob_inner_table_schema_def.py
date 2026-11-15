@@ -2471,6 +2471,30 @@ all_ai_column_def = dict(
 )
 def_table_schema(**all_ai_column_def)
 
+all_ai_column_task_def = dict(
+    owner = 'database-competition',
+    table_name = '__all_ai_column_task',
+    table_id = '1132',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+      ('table_id', 'int'),
+      ('column_id', 'int'),
+      ('request_id', 'varchar:256')
+  ],
+
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('rowkey_predicate', 'varchar:1024', 'false'),
+        ('state', 'int', 'false'),
+        ('retry_count', 'int', 'false'),
+        ('eligible_ts', 'timestamp', 'true'),
+        ('retry_ts', 'timestamp', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
+
 
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',
