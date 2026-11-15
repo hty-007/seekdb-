@@ -884,6 +884,13 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
       }
     }
 
+    // AI columns carry three hidden companion columns (state / request / result spec)
+    if (OB_SUCC(ret) && RESOLVE_COL_ONLY != resolve_rule) {
+      if (OB_FAIL(add_ai_column_hidden_columns(node, table_schema))) {
+        SQL_RESV_LOG(WARN, "failed to add hidden columns for ai column", K(ret));
+      }
+    }
+
     if (OB_SUCC(ret)) {
       for (int32_t i = resolved_cols_count; i < resolved_cols.count() && OB_SUCC(ret); i++) {
         ObColumnSchemaV2 &hidden_col = resolved_cols.at(i);
@@ -2343,4 +2350,74 @@ int ObCreateTableResolver::uk_or_heap_table_pk_add_to_index_list(ObArray<int> &i
   return ret;
 }
 }//end namespace sql
+
+int ObCreateTableResolver::add_ai_column_hidden_columns(const ParseNode *node,
+                                                       ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node) || OB_ISNULL(node->children_)) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_RESV_LOG(WARN, "invalid argument", K(ret));
+  }
+  for (int32_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+    ParseNode *element = node->children_[i];
+    if (OB_ISNULL(element)) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_RESV_LOG(WARN, "element is null", K(ret), K(i));
+    } else if (T_COLUMN_DEFINITION != element->type_) {
+      // not a column definition
+    } else if (OB_ISNULL(element->children_) || element->num_child_ < 3) {
+      ret = OB_INVALID_ARGUMENT;
+      SQL_RESV_LOG(WARN, "invalid column definition node", K(ret), K(element->num_child_));
+    } else {
+      ParseNode *attrs = element->children_[2];
+      ParseNode *name_node = element->children_[0];
+      bool is_ai_column = false;
+      if (NULL != attrs && T_COLUMN_ATTRIBUTES == attrs->type_ && NULL != attrs->children_) {
+        for (int32_t j = 0; !is_ai_column && j < attrs->num_child_; ++j) {
+          if (NULL != attrs->children_[j] && T_CONSTR_AI_COLUMN == attrs->children_[j]->type_) {
+            is_ai_column = true;
+          }
+        }
+      }
+      if (!is_ai_column) {
+        // ordinary column
+      } else if (OB_ISNULL(name_node) || OB_ISNULL(name_node->str_value_)
+                 || name_node->str_len_ <= 0) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "ai column name is invalid", K(ret));
+      } else {
+        static const char *suffix[3] = {"__ai_state", "__ai_request", "__ai_result_spec"};
+        for (int64_t k = 0; OB_SUCC(ret) && k < 3; ++k) {
+          char name_buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
+          int64_t name_len = snprintf(name_buf, sizeof(name_buf), "%.*s%s",
+                                      static_cast<int>(name_node->str_len_),
+                                      name_node->str_value_, suffix[k]);
+          ObColumnSchemaV2 hidden_column;
+          if (OB_UNLIKELY(name_len <= 0 || name_len > OB_MAX_COLUMN_NAME_LENGTH)) {
+            ret = OB_ERR_UNEXPECTED;
+            SQL_RESV_LOG(WARN, "hidden column name is too long", K(ret), K(name_len));
+          } else if (OB_FAIL(hidden_column.set_column_name(ObString(static_cast<int32_t>(name_len), name_buf)))) {
+            SQL_RESV_LOG(WARN, "failed to set hidden column name", K(ret));
+          } else {
+            hidden_column.set_column_id(gen_column_id());
+            hidden_column.set_is_hidden(true);
+            hidden_column.set_nullable(true);
+            if (0 == k) {
+              hidden_column.set_data_type(ObIntType);
+            } else {
+              hidden_column.set_data_type(ObLongTextType);
+              hidden_column.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+              hidden_column.set_charset_type(CHARSET_UTF8MB4);
+            }
+            if (OB_FAIL(table_schema.add_column(hidden_column))) {
+              SQL_RESV_LOG(WARN, "failed to add hidden column", K(ret), K(k));
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
 }//end namespace oceanbase
