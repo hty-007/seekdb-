@@ -2244,7 +2244,8 @@ bool match_ci(const ObString &text, int64_t pos, const char *pattern)
 
 // the ai column spec is stored in the comment of the hidden result-spec column:
 //   ai_expr=ai_complete('model', <prompt>)\nsync_mode=async\nmax_retries=2
-int parse_ai_column_expr(const ObString &comment, ObString &model_name, ObString &prompt_expr)
+int parse_ai_column_expr(const ObString &comment, ObString &model_name, ObString &prompt_expr,
+                         bool &is_embedding)
 {
   int ret = OB_SUCCESS;
   int64_t expr_pos = -1;
@@ -2258,9 +2259,13 @@ int parse_ai_column_expr(const ObString &comment, ObString &model_name, ObString
     expr_pos = 0;
   }
   int64_t open_pos = -1;
+  is_embedding = false;
   for (int64_t i = expr_pos; -1 == open_pos && i < comment.length(); ++i) {
     if (match_ci(comment, i, "ai_complete(")) {
       open_pos = i + 12;
+    } else if (match_ci(comment, i, "ai_embed(")) {
+      open_pos = i + 9;
+      is_embedding = true;
     }
   }
   if (-1 == expr_pos || -1 == open_pos) {
@@ -2431,8 +2436,12 @@ int ObServer::ObAiColumnWorkerTask::flush_pending_tasks()
       } else {
         ObAIFuncModel model(task_allocator_, *info, endpoint);
         ObString content = task.prompt_;
-        ObString system_prompt = task.system_prompt_;
-        call_ret = model.call_completion_with_system(system_prompt, content, NULL, result_str);
+        if (task.is_embedding_) {
+          call_ret = model.call_dense_embedding(content, NULL, result_str);
+        } else {
+          ObString system_prompt = task.system_prompt_;
+          call_ret = model.call_completion_with_system(system_prompt, content, NULL, result_str);
+        }
       }
       if (OB_SUCCESS == call_ret && !result_str.empty()
           && OB_SUCCESS == ob_write_string(task_allocator_, result_str, outcomes[k].value_)) {
@@ -2598,8 +2607,9 @@ int ObServer::ObAiColumnWorkerTask::process_once()
                                         column.column_name_.length(), column.column_name_.ptr());
     ObString ai_expr = column.spec_;
     bool has_expr = false;
-    for (int64_t k = 0; !has_expr && k + 12 <= ai_expr.length(); ++k) {
-      has_expr = ai_column_worker_helper::match_ci(ai_expr, k, "ai_complete(");
+    for (int64_t k = 0; !has_expr && k + 9 <= ai_expr.length(); ++k) {
+      has_expr = ai_column_worker_helper::match_ci(ai_expr, k, "ai_complete(")
+                 || ai_column_worker_helper::match_ci(ai_expr, k, "ai_embed(");
     }
     if (!has_expr) {
       ObSqlString spec_sql;
@@ -2623,10 +2633,11 @@ int ObServer::ObAiColumnWorkerTask::process_once()
     }
     ObString model_name;
     ObString prompt_expr;
+    bool is_embedding = false;
     if (OB_FAIL(ret) || ai_expr.empty()) {
       continue;
     } else if (OB_FAIL(ai_column_worker_helper::parse_ai_column_expr(ai_expr, model_name,
-                                                                    prompt_expr))) {
+                                                                    prompt_expr, is_embedding))) {
       LOG_INFO("skip an ai column expression the worker does not understand", K(ai_expr));
       ret = OB_SUCCESS;
       continue;
@@ -2794,6 +2805,7 @@ int ObServer::ObAiColumnWorkerTask::process_once()
       task.max_retries_ = column.max_retries_;
       task.attempt_ = attempts.at(j);
       task.is_integer_ = is_integer_type;
+      task.is_embedding_ = is_embedding;
       task.prompt_ = prompt;
       task.predicate_ = predicate;
       task.system_prompt_ = system_prompt;

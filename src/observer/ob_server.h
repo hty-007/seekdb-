@@ -288,6 +288,7 @@ public:
       int64_t max_retries_;
       int64_t attempt_;
       bool is_integer_;
+      bool is_embedding_;
       common::ObString db_name_;
       common::ObString table_name_;
       common::ObString result_column_;
