@@ -105,6 +105,16 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     }
   }
 
+  // Invalidate ai columns before the implicit assignments are resolved: an invalidated
+  // ai column is an extra write to the result column, and resolve_additional_assignments()
+  // must see it to emit the hidden vector-index companion assignments.
+  if (OB_SUCC(ret)) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < tables_assign.count(); i++) {
+      if (OB_FAIL(invalidate_ai_columns(tables_assign.at(i)))) {
+      }
+    }
+  }
+
   if (OB_SUCC(ret)) {
     // Parse cascading update columns
     if (OB_FAIL(resolve_additional_assignments(tables_assign,
@@ -115,9 +125,8 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
   //add column for table scan, keep rowkey column in the head
   if (OB_SUCC(ret)) {
     for (int64_t i = 0; OB_SUCC(ret) && i < tables_assign.count(); i++) {
-      if (OB_FAIL(invalidate_ai_columns(tables_assign.at(i)))) {
-      } else if (OB_FAIL(generate_update_table_info(tables_assign.at(i)))) {
-      } else { /*do nothing*/ }
+      if (OB_FAIL(generate_update_table_info(tables_assign.at(i)))) {
+      }
     }
   }
 
