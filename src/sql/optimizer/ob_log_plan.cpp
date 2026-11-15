@@ -12039,12 +12039,39 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
     tr_info.match_expr_ = match_against;
     tr_info.pushdown_match_filter_ = match_pred;
+    if (get_stmt()->is_select_stmt() && !get_stmt()->has_order_by()
+        && table_scan->is_text_retrieval_scan()
+        && !table_scan->is_vec_idx_scan()
+        && NATURAL_LANGUAGE_MODE == match_against->get_mode_flag()
+        && T_OP_BOOL == match_pred->get_expr_type() && 1 == match_pred->get_param_count()
+        && get_stmt()->get_match_exprs().count() == 1) {
+      ObSEArray<ObRawExpr *, 16> stmt_exprs;
+      if (OB_FAIL(get_stmt()->get_relation_exprs(stmt_exprs))) {
+      } else {
+        bool predicate_seen = false;
+        bool another_use = false;
+        for (ObRawExpr *expr : stmt_exprs) {
+          if (expr == match_pred) {
+            predicate_seen = true;
+          } else if (expr->has_flag(CNT_MATCH_EXPR) || expr->has_flag(IS_MATCH_EXPR)) {
+            another_use = true;
+            break;
+          }
+        }
+        if (predicate_seen && !another_use) {
+          // In natural-language mode each matching posting has a positive BM25
+          // contribution. A bare truth test only needs the matching document IDs.
+          tr_info.need_calc_relevance_ = false;
+          tr_info.pushdown_match_filter_ = nullptr;
+        }
+      }
+    }
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
     if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {
       table_scan->set_rowkey_doc_table_id(tr_info.rowkey_idx_tid_);
     }
-    if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
+    if (FAILEDx(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
     } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.rowkey_idx_tid_ == OB_INVALID_ID))) {
     }
   }

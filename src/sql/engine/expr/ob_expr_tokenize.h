@@ -22,12 +22,12 @@
 #include "lib/string/ob_string.h"
 #include "sql/engine/expr/ob_expr_operator.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
+#include "data_plane/fts/ob_fts_parser_name.h"
 
 namespace oceanbase
 {
 namespace sql
 {
-class MultimodeAlloctor;
 class ObExprTokenize : public ObStringExprOperator
 {
 public:
@@ -69,6 +69,7 @@ private:
   public:
     // for property and tmp json string
     mutable ObArenaAllocator allocator_;
+    char parser_name_buf_[storage::OB_FT_PARSER_NAME_LENGTH];
     ObString parser_name_;
     ObString properties_;
     ObObjMeta meta_;
@@ -83,14 +84,12 @@ private:
 private:
   static int parse_param(const ObExpr &expr,
                          ObEvalCtx &ctx,
-                         common::ObArenaAllocator &allocator,
                          TokenizeParam &param);
 
   static int parse_fulltext(const ObExpr &expr, ObEvalCtx &ctx, TokenizeParam &param);
   static int parse_parser_name(const ObExpr &expr, ObEvalCtx &ctx, TokenizeParam &param);
   static int parse_parser_properties(const ObExpr &expr,
                                      ObEvalCtx &ctx,
-                                     MultimodeAlloctor &mm_alloc,
                                      TokenizeParam &param);
 
   static int tokenize_fulltext(const TokenizeParam &param,
