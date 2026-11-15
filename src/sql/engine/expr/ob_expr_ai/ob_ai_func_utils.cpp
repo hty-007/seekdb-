@@ -258,7 +258,13 @@ int ObOllamaUtils::get_header(common::ObIAllocator &allocator,
                               common::ObArray<ObString> &headers) 
 {
   int ret = OB_SUCCESS;
-  // ollama header is empty, do nothing
+  // ollama needs no authorization header, but the http client refuses an empty
+  // header list, so the content type is always sent
+  ObString content_type_str("Content-Type: application/json");
+  ObString content_type_c_str;
+  if (OB_FAIL(ob_write_string(allocator, content_type_str, content_type_c_str, true))) {
+  } else if (OB_FAIL(headers.push_back(content_type_c_str))) {
+  }
   return ret;
 }
 
@@ -1059,8 +1065,12 @@ int ObAIFuncUtils::get_complete_provider(ObIAllocator &allocator, const ObString
       || ob_provider_check(provider, ObAIFuncProviderUtils::ALIYUN) 
       || ob_provider_check(provider, ObAIFuncProviderUtils::DEEPSEEK)
       || ob_provider_check(provider, ObAIFuncProviderUtils::SILICONFLOW)
-      || ob_provider_check(provider, ObAIFuncProviderUtils::HUNYUAN)) {
+      || ob_provider_check(provider, ObAIFuncProviderUtils::HUNYUAN)
+      ) {
     complete_provider = OB_NEWx(ObOpenAIUtils::ObOpenAIComplete, &allocator);
+  } else if (ob_provider_check(provider, "OLLAMA")) {
+    // ollama speaks its own native protocol and needs no api key
+    complete_provider = OB_NEWx(ObOllamaUtils::ObOllamaComplete, &allocator);
   } else if (ob_provider_check(provider, ObAIFuncProviderUtils::DASHSCOPE)) {
     complete_provider = OB_NEWx(ObDashscopeUtils::ObDashscopeComplete, &allocator);
   } else {
@@ -1082,8 +1092,11 @@ int ObAIFuncUtils::get_embed_provider(ObIAllocator &allocator, const ObString &p
   } else if (ob_provider_check(provider, ObAIFuncProviderUtils::OPENAI) 
       || ob_provider_check(provider, ObAIFuncProviderUtils::ALIYUN)
       || ob_provider_check(provider, ObAIFuncProviderUtils::HUNYUAN)
-      || ob_provider_check(provider, ObAIFuncProviderUtils::SILICONFLOW)) {
+      || ob_provider_check(provider, ObAIFuncProviderUtils::SILICONFLOW)
+      ) {
     embed_provider = OB_NEWx(ObOpenAIUtils::ObOpenAIEmbed, &allocator);
+  } else if (ob_provider_check(provider, "OLLAMA")) {
+    embed_provider = OB_NEWx(ObOllamaUtils::ObOllamaEmbed, &allocator);
   } else if (ob_provider_check(provider, ObAIFuncProviderUtils::DASHSCOPE)) {
     embed_provider = OB_NEWx(ObDashscopeUtils::ObDashscopeEmbed, &allocator);
   } else {
