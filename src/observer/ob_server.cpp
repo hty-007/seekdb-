@@ -29,6 +29,8 @@
 #include <thread>
 #include <cstdio>
 #include "observer/ob_server.h"
+#include "observer/ob_inner_sql_connection.h"
+#include "common/mysqlclient/ob_mysql_result.h"
 #include "observer/ob_system_package_load_service.h"
 #include "rootserver/ob_ddl_service_launcher.h"
 #include "share/ob_autoincrement_service.h"
@@ -629,6 +631,7 @@ ObServer::ObServer()
     duty_task_(),
     sql_mem_task_(),
     ctas_clean_up_task_(),
+    ai_column_worker_task_(),
     refresh_cpu_frequency_task_(),
     schema_status_proxy_(sql_proxy_),
     is_log_dir_empty_(false),
@@ -2181,6 +2184,92 @@ int ObServer::init_network()
   return ret;
 }
 
+
+int ObServer::ObAiColumnWorkerTask::init(common::ObTimer &timer)
+{
+  int ret = OB_SUCCESS;
+  if (is_inited_) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_FAIL(timer.schedule(*this, POLL_INTERVAL_US, true /*repeat*/, false))) {
+    LOG_WARN("failed to schedule the ai column worker", K(ret));
+  } else {
+    is_inited_ = true;
+  }
+  return ret;
+}
+
+void ObServer::ObAiColumnWorkerTask::runTimerTask()
+{
+  int ret = OB_SUCCESS;
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(process_once())) {
+    LOG_WARN("failed to process the pending ai column tasks", K(ret));
+  }
+}
+
+int ObServer::ObAiColumnWorkerTask::process_once()
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator("AiColWorker");
+  sqlclient::ObISQLConnectionGuard conn_guard;
+  sqlclient::ObISQLConnection *conn = NULL;
+  if (OB_FAIL(ObInnerSQLConnection::create_connection_with_owned_session(false, 0, conn_guard))) {
+    LOG_WARN("failed to create the ai column worker connection", K(ret));
+  } else if (OB_ISNULL(conn = conn_guard.get_ptr())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the ai column worker connection is null", K(ret));
+  } else {
+    ObSqlString sql;
+    ObISQLClient::ReadResult read_result;
+    if (OB_FAIL(sql.append("select table_id, column_id, request_id, rowkey_predicate, "
+                           "state, retry_count from oceanbase.__all_ai_column_task limit 16"))) {
+      LOG_WARN("failed to build the ai column task query", K(ret));
+    } else if (OB_FAIL(conn->execute_read(sql.string(), read_result))) {
+      LOG_WARN("failed to read the pending ai column tasks", K(ret), K(sql));
+    } else {
+      sqlclient::ObMySQLResult *result = read_result.get_result();
+      int64_t task_count = 0;
+      if (OB_ISNULL(result)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("the ai column task query returned no result", K(ret));
+      }
+      while (OB_SUCC(ret) && OB_SUCC(result->next())) {
+        int64_t table_id = 0;
+        int64_t column_id = 0;
+        int64_t state = 0;
+        int64_t retry_count = 0;
+        ObString request_id;
+        ObString predicate;
+        if (OB_FAIL(result->get_int("table_id", table_id))) {
+          LOG_WARN("failed to get the ai task table id", K(ret));
+        } else if (OB_FAIL(result->get_int("column_id", column_id))) {
+          LOG_WARN("failed to get the ai task column id", K(ret));
+        } else if (OB_FAIL(result->get_int("state", state))) {
+          LOG_WARN("failed to get the ai task state", K(ret));
+        } else if (OB_FAIL(result->get_int("retry_count", retry_count))) {
+          LOG_WARN("failed to get the ai task retry count", K(ret));
+        } else if (OB_FAIL(result->get_varchar("request_id", request_id))) {
+          LOG_WARN("failed to get the ai task request id", K(ret));
+        } else if (OB_FAIL(result->get_varchar("rowkey_predicate", predicate))) {
+          LOG_WARN("failed to get the ai task predicate", K(ret));
+        } else {
+          ++task_count;
+          LOG_INFO("pending ai column task", K(table_id), K(column_id), K(request_id),
+                   K(predicate), K(state), K(retry_count));
+        }
+      }
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      }
+      if (OB_SUCC(ret) && 0 == task_count && REACH_TIME_INTERVAL(10 * 1000 * 1000L)) {
+        LOG_INFO("no pending ai column task");
+      }
+    }
+  }
+  return ret;
+}
+
 int ObServer::init_server_runtime()
 {
   int ret = OB_SUCCESS;
@@ -2191,6 +2280,7 @@ int ObServer::init_server_runtime()
   if (OB_SUCC(ret)) {
     if (OB_FAIL(duty_task_.schedule(server_gtimer_))) {
     } else if (OB_FAIL(sql_mem_task_.schedule(sql_mem_timer_))) {
+    } else if (OB_FAIL(ai_column_worker_task_.init(server_gtimer_))) {
     }
   }
 

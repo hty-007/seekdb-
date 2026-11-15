@@ -280,6 +280,19 @@ public:
     bool is_inited_;
   };
 
+  class ObAiColumnWorkerTask: public common::ObTimerTask
+  {
+  public:
+    ObAiColumnWorkerTask() : is_inited_(false) {}
+    virtual ~ObAiColumnWorkerTask() {}
+    int init(common::ObTimer& timer);
+    virtual void runTimerTask() override;
+  private:
+    int process_once();
+    const static int64_t POLL_INTERVAL_US = 500 * 1000L;//500ms
+    bool is_inited_;
+  };
+
   class ObRefreshCpuFreqTimeTask: public common::ObTimerTask
   {
   public:
@@ -486,6 +499,7 @@ private:
   ObServerDutyTask duty_task_;
   ObSqlMemoryTimerTask sql_mem_task_;
   ObCTASCleanUpTask ctas_clean_up_task_;     // repeat & no retry
+  ObAiColumnWorkerTask ai_column_worker_task_;
   ObRedefTableHeartBeatTask redef_table_heart_beat_task_;
   ObRefreshCpuFreqTimeTask refresh_cpu_frequency_task_;
   blocksstable::ObStorageEnv storage_env_;
