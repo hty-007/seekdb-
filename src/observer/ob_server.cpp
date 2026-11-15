@@ -2245,6 +2245,10 @@ int parse_ai_column_expr(const ObString &comment, ObString &model_name, ObString
       expr_pos = i + 8;
     }
   }
+  if (-1 == expr_pos) {
+    // the metadata keeps only the expression, without the ai_expr= prefix
+    expr_pos = 0;
+  }
   int64_t open_pos = -1;
   for (int64_t i = expr_pos; -1 == open_pos && i < comment.length(); ++i) {
     if (match_ci(comment, i, "ai_complete(")) {
@@ -2333,6 +2337,7 @@ int ObServer::ObAiColumnWorkerTask::process_once()
   ObArenaAllocator allocator("AiColWorker");
   sqlclient::ObISQLConnectionGuard conn_guard;
   sqlclient::ObISQLConnection *conn = NULL;
+  LOG_INFO("ai column worker pass start");
   if (OB_FAIL(ObInnerSQLConnection::create_connection_with_owned_session(false, 0, conn_guard))) {
     LOG_WARN("failed to create the ai column worker connection", K(ret));
   } else if (OB_ISNULL(conn = conn_guard.get_ptr())) {
@@ -2385,6 +2390,7 @@ int ObServer::ObAiColumnWorkerTask::process_once()
       if (OB_ITER_END == ret) {
         ret = OB_SUCCESS;
       }
+      LOG_INFO("ai column worker metadata loaded", K(ret), "column_count", columns.count());
       for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
         const PendingColumn &column = columns.at(i);
         char result_buf[OB_MAX_COLUMN_NAME_LENGTH + 1];
@@ -2400,10 +2406,16 @@ int ObServer::ObAiColumnWorkerTask::process_once()
             || request_len > OB_MAX_COLUMN_NAME_LENGTH) {
           continue;
         }
-        // the expression text lives in the comment of the hidden result-spec column
+        // the metadata usually keeps the expression text, otherwise it lives in the
+        // comment of the hidden result-spec column
         ObSqlString spec_sql;
-        ObString ai_expr_comment;
-        {
+        ObString ai_expr_comment = column.spec_;
+        bool has_expr = false;
+        for (int64_t k = 0; !has_expr && k + 12 <= ai_expr_comment.length(); ++k) {
+          has_expr = ai_column_worker_helper::match_ci(ai_expr_comment, k, "ai_complete(");
+        }
+        if (!has_expr) {
+          ai_expr_comment.reset();
           ObISQLClient::ReadResult spec_result;
           if (OB_FAIL(spec_sql.append_fmt("select comment from oceanbase.__all_column "
                                           "where table_id = %ld and column_id = %ld",
@@ -2418,6 +2430,9 @@ int ObServer::ObAiColumnWorkerTask::process_once()
             }
           }
         }
+        LOG_INFO("ai column worker column", K(column.table_id_), K(column.column_id_),
+                 K(column.spec_column_id_), "spec_len", column.spec_.length(),
+                 "expr_len", ai_expr_comment.length());
         if (OB_FAIL(ret) || ai_expr_comment.empty()) {
           continue;
         }
@@ -2446,6 +2461,7 @@ int ObServer::ObAiColumnWorkerTask::process_once()
             }
           }
         }
+        LOG_INFO("ai column worker rowkey", K(pk_name));
         if (OB_FAIL(ret) || pk_name.empty()) {
           continue;
         }
@@ -2478,6 +2494,8 @@ int ObServer::ObAiColumnWorkerTask::process_once()
             }
           }
         }
+        LOG_INFO("ai column worker pending rows", K(ret), K(column.table_id_),
+                 K(column.column_id_), "row_count", predicates.count());
         for (int64_t j = 0; OB_SUCC(ret) && j < predicates.count(); ++j) {
           const ObString &predicate = predicates.at(j);
           // the prompt of this row
