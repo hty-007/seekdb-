@@ -28,6 +28,51 @@ namespace oceanbase
 {
 namespace storage
 {
+class IKBuiltinDictionaries
+{
+public:
+  IKBuiltinDictionaries()
+    : allocator_(ObMemAttr("IKBuiltin")), main_cache_(allocator_),
+      quantifier_cache_(allocator_),
+      main_desc_("main_dict", ObFTDictType::DICT_IK_MAIN, CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN),
+      quantifier_desc_("quan_dict", ObFTDictType::DICT_IK_QUAN, CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN),
+      main_(allocator_, &main_cache_, main_desc_),
+      quantifiers_(allocator_, &quantifier_cache_, quantifier_desc_)
+  {}
+
+  int init(ObFTDictHub &hub)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(pin_dict(hub, main_desc_, main_cache_))) {
+    } else if (OB_FAIL(pin_dict(hub, quantifier_desc_, quantifier_cache_))) {
+    } else if (OB_FAIL(main_.init())) {
+    } else if (OB_FAIL(quantifiers_.init())) {
+    }
+    return ret;
+  }
+
+  const ObIFTDict *main() const { return &main_; }
+  const ObIFTDict *quantifiers() const { return &quantifiers_; }
+
+private:
+  static int pin_dict(ObFTDictHub &hub, const ObFTDictDesc &desc, ObFTCacheRangeContainer &cache)
+  {
+    int ret = hub.load_cache(desc, cache);
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = hub.build_cache(desc, cache);
+    }
+    return ret;
+  }
+
+  ObArenaAllocator allocator_;
+  ObFTCacheRangeContainer main_cache_;
+  ObFTCacheRangeContainer quantifier_cache_;
+  ObFTDictDesc main_desc_;
+  ObFTDictDesc quantifier_desc_;
+  ObFTRangeDict main_;
+  ObFTRangeDict quantifiers_;
+};
+
 int ObFTDictHub::init()
 {
   static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.
@@ -43,7 +88,36 @@ int ObFTDictHub::init()
 int ObFTDictHub::destroy()
 {
   int ret = OB_SUCCESS;
+  IKBuiltinDictionaries *dicts = ik_dicts_.exchange(nullptr);
+  if (OB_NOT_NULL(dicts)) {
+    OB_DELETE(IKBuiltinDictionaries, "IKBuiltin", dicts);
+  }
   is_inited_ = false;
+  return ret;
+}
+
+int ObFTDictHub::get_builtin_ik_dicts(const ObIFTDict *&main, const ObIFTDict *&quantifiers)
+{
+  int ret = OB_SUCCESS;
+  IKBuiltinDictionaries *dicts = ik_dicts_.load(std::memory_order_acquire);
+  if (OB_ISNULL(dicts)) {
+    std::lock_guard<std::mutex> guard(ik_init_lock_);
+    dicts = ik_dicts_.load(std::memory_order_relaxed);
+    if (OB_NOT_NULL(dicts)) {
+      // Another worker finished initialization while this worker waited.
+    } else if (OB_ISNULL(dicts = OB_NEW(IKBuiltinDictionaries, "IKBuiltin"))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(dicts->init(*this))) {
+      OB_DELETE(IKBuiltinDictionaries, "IKBuiltin", dicts);
+    } else {
+      // The built-in dictionaries are read-only and live until server shutdown.
+      ik_dicts_.store(dicts, std::memory_order_release);
+    }
+  }
+  if (OB_SUCC(ret)) {
+    main = dicts->main();
+    quantifiers = dicts->quantifiers();
+  }
   return ret;
 }
 int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)

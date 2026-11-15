@@ -220,7 +220,8 @@ int ObTokenStopWordNormalizer::filter_special_marks(const ObDatum &check_token, 
 
 ObBasicEnglishNormalizer::ObBasicEnglishNormalizer()
   : ObTokenNormalizer(),
-    norm_allocator_("TxtTokGrpFilter", OB_MALLOC_NORMAL_BLOCK_SIZE)
+    norm_allocator_("TxtTokGrpFilter", OB_MALLOC_NORMAL_BLOCK_SIZE),
+    token_allocator_(nullptr)
 {
 }
 
@@ -244,7 +245,9 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
   } else {
     next_token.reset();
     token_freq = 0;
-    norm_allocator_.reuse();
+    if (nullptr == token_allocator_) {
+      norm_allocator_.reuse();
+    }
     ObDatum tmp_datum;
     bool found_alnum = false;
     uint32_t norm_token_len = 0;
@@ -295,7 +298,8 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
     } else {
       ObString norm_alnum_token(norm_token_len, norm_token_ptr);
       ObString norm_lower_token;
-      if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+      ObIAllocator &allocator = nullptr == token_allocator_ ? norm_allocator_ : *token_allocator_;
+      if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, allocator))) {
       } else {
         next_token.set_string(norm_lower_token);
       }

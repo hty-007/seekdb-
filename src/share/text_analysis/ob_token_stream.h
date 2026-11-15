@@ -127,11 +127,13 @@ public:
   ObBasicEnglishNormalizer();
   virtual ~ObBasicEnglishNormalizer() {};
 
+  void set_token_allocator(ObIAllocator *allocator) { token_allocator_ = allocator; }
   virtual void reset() override;
   virtual void reuse() override;
   virtual int get_next(ObDatum &next_token, int64_t &token_freq) override;
 private:
   ObArenaAllocator norm_allocator_;
+  ObIAllocator *token_allocator_;
 };
 
 // group (deduplicate) and count

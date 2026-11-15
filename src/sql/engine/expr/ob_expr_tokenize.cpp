@@ -203,7 +203,10 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, param))) {
   } else if (!param.properties_.empty() && OB_FAIL(param.reform_parser_properties(param.properties_))) {
-  } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+  } else if ((!param.properties_.empty()
+              || CHARSET_UTF8MB4 != ObCharset::charset_type_by_coll(param.meta_.get_collation_type()))
+             && OB_FAIL(param.try_load_dictionary_for_ik())) {
+    // Explicit options and unsupported charsets still use the existing validation.
   }
   return ret;
 }
