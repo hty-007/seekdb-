@@ -379,7 +379,8 @@ struct ObResolverParams
        package_guard_(NULL),
        star_expansion_infos_(),
        is_resolve_fake_cte_table_(false),
-       is_in_view_(false)
+       is_in_view_(false),
+       include_hidden_columns_(false)
   {}
   bool is_force_trace_log() { return force_trace_log_; }
 
@@ -455,6 +456,8 @@ public:
   common::ObArray<ObStarExpansionInfo> star_expansion_infos_;
   bool is_resolve_fake_cte_table_;
   bool is_in_view_;
+  // the derived query of __all_ai_column_task reads the hidden ai columns
+  bool include_hidden_columns_;
 };
 } // end namespace sql
 } // end namespace oceanbase

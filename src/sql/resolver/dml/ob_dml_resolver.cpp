@@ -38,6 +38,8 @@
 #include "sql/das/ob_domain_id.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/engine/expr/ob_expr_regexp.h"
+#include "sql/resolver/dml/ob_select_resolver.h"
+#include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "sql/resolver/dcl/ob_dcl_resolver.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
@@ -2420,6 +2422,12 @@ int ObDMLResolver::resolve_basic_table_without_cte(const ParseNode &parse_tree, 
         if (OB_FAIL(expand_view(*table_item))) {
         }
       }
+      if (OB_SUCCESS == ret && !table_item->is_view_table_
+          && stmt->is_select_stmt()
+          && share::OB_ALL_AI_COLUMN_TASK_TID == table_item->ref_id_) {
+        if (OB_FAIL(expand_ai_column_task_table(*table_item))) {
+        }
+      }
       if (OB_SUCCESS == ret && part_node) {
         if (is_virtual_table(table_item->ref_id_) &&
             table_schema->get_part_option().get_part_num() > 1) {
@@ -3049,7 +3057,8 @@ int ObDMLResolver::resolve_table_column_expr(const ObQualifiedName &q_name, ObRa
       }
     } else {
       ColumnItem *col_item = NULL;
-      if (OB_FAIL(resolve_single_table_column_item(*table_item, q_name.col_name_, false, col_item))) {
+      if (OB_FAIL(resolve_single_table_column_item(*table_item, q_name.col_name_,
+                                                   params_.include_hidden_columns_, col_item))) {
       } else if (OB_ISNULL(col_item)) {
         ret = OB_ERR_UNEXPECTED;
       } else {
@@ -4179,6 +4188,172 @@ int ObDMLResolver::resolve_base_or_alias_table_item_normal(const uint64_t databa
       if (OB_FAIL(stmt->add_table_item(session_info_, item, params_.have_same_table_name_))) {
       } else {
         tbl_item = item;
+      }
+    }
+  }
+  return ret;
+}
+
+
+namespace {
+
+static bool is_ai_state_column(const ObColumnSchemaV2 &column)
+{
+  const int64_t suffix_len = static_cast<int64_t>(strlen("__ai_state"));
+  const ObString &name = column.get_column_name_str();
+  return column.is_hidden() && name.length() > suffix_len
+         && 0 == ObString(static_cast<int32_t>(suffix_len),
+                          name.ptr() + name.length() - suffix_len).case_compare("__ai_state");
+}
+
+// builds concat('`c1` = ', cast(`c1` as char), ' and `c2` = ', cast(`c2` as char))
+static int build_rowkey_predicate_expr(const ObTableSchema &table, ObSqlString &pred)
+{
+  int ret = OB_SUCCESS;
+  bool first = true;
+  if (OB_FAIL(pred.append("concat("))) {
+  } else {
+    for (ObTableSchema::const_column_iterator iter = table.column_begin();
+         OB_SUCC(ret) && iter != table.column_end(); ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      if (NULL == column || column->is_hidden() || !column->is_rowkey_column()) {
+        continue;
+      } else {
+        const ObString &name = column->get_column_name_str();
+        if (OB_FAIL(pred.append_fmt("%s'`%.*s` = ', cast(`%.*s` as char)",
+                                    first ? "" : ", ' and ', ",
+                                    name.length(), name.ptr(),
+                                    name.length(), name.ptr()))) {
+        } else {
+          first = false;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !first) {
+    ret = pred.append(")");
+  }
+  return ret;
+}
+
+} // namespace
+
+int ObDMLResolver::expand_ai_column_task_table(TableItem &task_item)
+{
+  int ret = OB_SUCCESS;
+  ObDMLStmt *stmt = get_stmt();
+  ObSchemaGetterGuard *schema_guard = NULL;
+  ObSEArray<const ObTableSchema *, 32> tables;
+  ObSqlString sql;
+  bool first = true;
+  if (OB_ISNULL(stmt) || OB_ISNULL(schema_checker_) || OB_ISNULL(session_info_)
+      || OB_ISNULL(allocator_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("resolver is not ready", K(ret));
+  } else if (OB_ISNULL(schema_guard = schema_checker_->get_schema_guard())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("schema guard is null", K(ret));
+  } else if (OB_FAIL(schema_guard->get_table_schemas_in_runtime(tables))) {
+    LOG_WARN("failed to get table schemas", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
+      const ObTableSchema *table = tables.at(i);
+      const ObDatabaseSchema *db_schema = NULL;
+      ObString db_name;
+      if (OB_ISNULL(table) || !table->is_user_table()) {
+        continue;
+      } else if (OB_FAIL(schema_guard->get_database_schema(table->get_database_id(), db_schema))) {
+        LOG_WARN("failed to get database schema", K(ret), K(table->get_database_id()));
+      } else if (OB_ISNULL(db_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("database schema is null", K(ret), K(table->get_database_id()));
+      } else {
+        db_name = db_schema->get_database_name_str();
+        ObSqlString pred;
+        bool pred_ready = false;
+        for (ObTableSchema::const_column_iterator iter = table->column_begin();
+             OB_SUCC(ret) && iter != table->column_end(); ++iter) {
+          const ObColumnSchemaV2 *state_column = *iter;
+          if (NULL == state_column || !is_ai_state_column(*state_column)) {
+            continue;
+          } else {
+            const ObString &state_name = state_column->get_column_name_str();
+            const ObString ai_name(
+                state_name.length() - static_cast<int32_t>(strlen("__ai_state")),
+                state_name.ptr());
+            const ObColumnSchemaV2 *result_column = table->get_column_schema(ai_name);
+            if (OB_ISNULL(result_column)) {
+              continue;
+            } else if (!pred_ready) {
+              if (OB_FAIL(build_rowkey_predicate_expr(*table, pred))) {
+                LOG_WARN("failed to build the rowkey predicate", K(ret), K(table->get_table_id()));
+              } else {
+                pred_ready = true;
+              }
+            }
+            if (OB_SUCC(ret)) {
+              const ObString &table_name = table->get_table_name_str();
+              if (OB_FAIL(sql.append_fmt(
+                      "%sselect %lu as table_id, %lu as column_id, %.*s as request_id, "
+                      "%.*s as rowkey_predicate, 0 as state, 0 as retry_count, now(6) as eligible_ts "
+                      "from `%.*s`.`%.*s` where (%.*s is null or %.*s = 0)",
+                      first ? "" : " union all ",
+                      table->get_table_id(), result_column->get_column_id(),
+                      static_cast<int>(pred.length()), pred.ptr(),
+                      static_cast<int>(pred.length()), pred.ptr(),
+                      db_name.length(), db_name.ptr(),
+                      table_name.length(), table_name.ptr(),
+                      state_name.length(), state_name.ptr(),
+                      state_name.length(), state_name.ptr()))) {
+                LOG_WARN("failed to build the derived task select", K(ret));
+              } else {
+                first = false;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && first) {
+    // no ai table yet: keep an empty derived relation
+    if (OB_FAIL(sql.append("select cast(0 as unsigned) as table_id, cast(0 as unsigned) as column_id, "
+                           "cast('' as char(1)) as request_id, cast('' as char(1)) as rowkey_predicate, "
+                           "0 as state, 0 as retry_count, now(6) as eligible_ts from dual where 1 = 0"))) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ParseResult result;
+    ObString sql_text;
+    ObParser parser(*allocator_, session_info_->get_sql_mode(), session_info_->get_charsets4parser());
+    ObSelectStmt *sub_stmt = NULL;
+    sql_text = sql.string();
+    if (OB_FAIL(parser.parse(sql_text, result))) {
+      LOG_WARN("failed to parse the derived task sql", K(ret), K(sql));
+    } else if (OB_ISNULL(result.result_tree_) || result.result_tree_->num_child_ < 1
+               || OB_ISNULL(result.result_tree_->children_[0])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the derived task sql produced no statement", K(ret));
+    } else {
+      ObSelectResolver select_resolver(params_);
+      select_resolver.set_current_level(current_level_);
+      select_resolver.set_current_view_level(current_view_level_);
+      select_resolver.set_parent_namespace_resolver(parent_namespace_resolver_);
+      const bool org_include_hidden = params_.include_hidden_columns_;
+      params_.include_hidden_columns_ = true;
+      ret = select_resolver.resolve_child_stmt(*result.result_tree_->children_[0]);
+      params_.include_hidden_columns_ = org_include_hidden;
+      if (OB_FAIL(ret)) {
+        LOG_WARN("failed to resolve the derived task sql", K(ret), K(sql));
+      } else if (OB_ISNULL(sub_stmt = select_resolver.get_child_stmt())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("the derived task stmt is null", K(ret));
+      } else {
+        task_item.type_ = TableItem::GENERATED_TABLE;
+        task_item.ref_query_ = sub_stmt;
+        task_item.is_view_table_ = false;
+        task_item.is_system_table_ = false;
+        task_item.ref_id_ = OB_INVALID_ID;
       }
     }
   }

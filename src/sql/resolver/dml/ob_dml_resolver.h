@@ -491,6 +491,8 @@ protected:
                                   ObDMLStmt *dml_stmt,
                                   bool &is_generated);
   virtual int expand_view(TableItem &view_item);
+  // __all_ai_column_task is derived from the pending rows of every ai table
+  int expand_ai_column_task_table(TableItem &task_item);
   int do_expand_view(TableItem &view_item, ObChildStmtResolver &view_resolver);
   int check_pad_generated_column(const ObSQLMode sql_mode,
                                  const share::schema::ObTableSchema &table_schema,
