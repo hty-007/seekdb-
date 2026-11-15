@@ -2286,6 +2286,13 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       {
         break;
       }
+      case T_CONSTR_AI_COLUMN: {
+        // <column> <type> AI COLUMN '(' expr ')' [WITH (...)]
+        // The AI expression node ($1) and the option list ($2) are not consumed yet:
+        // wiring the hidden state/request/result-spec columns and the __all_ai_column
+        // metadata is the next step.
+        break;
+      }
       default:  // won't be here
         ret = OB_ERR_PARSER_SYNTAX;
         SQL_RESV_LOG(WARN, "Wrong column attribute", K(ret), K(attr_node->type_));
