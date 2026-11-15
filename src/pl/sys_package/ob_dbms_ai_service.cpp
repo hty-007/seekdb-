@@ -314,8 +314,9 @@ int ObDBMSAiService::drop_ai_model(ObPLExecCtx &ctx, sql::ParamStore &params, co
   } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
   } else if (OB_FAIL(schema_guard.get_ai_model_schema( model_name, ai_model_schema))) {
   } else if (OB_ISNULL(ai_model_schema)) {
-    ret = OB_AI_FUNC_MODEL_NOT_FOUND;
-    LOG_USER_ERROR(OB_AI_FUNC_MODEL_NOT_FOUND, model_name.length(), model_name.ptr());
+    // dropping a model that is already gone is a no-op, this keeps cleanup
+    // scripts idempotent and avoids waiting on the root service at all
+    LOG_INFO("ai model does not exist, nothing to drop", K(model_name));
   } else if (OB_ISNULL(ctx.exec_ctx_)) {
     ret =  OB_ERR_UNEXPECTED;
   } else if (OB_ISNULL(ctx.exec_ctx_->get_sql_ctx())) {
