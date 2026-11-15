@@ -32,6 +32,7 @@
 #include "observer/ob_inner_sql_connection.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 #include "query/ai/ob_ai_endpoint_resolver.h"
+#include "sql/executor/ob_worker_session_guard.h"
 #include "share/rc/ob_server_runtime.h"
 #include "common/mysqlclient/ob_mysql_result.h"
 #include "observer/ob_system_package_load_service.h"
@@ -2355,8 +2356,6 @@ int ObServer::ObAiColumnWorkerTask::process_once()
   } else if (OB_ISNULL(conn = conn_guard.get_ptr())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("the ai column worker connection is null", K(ret));
-  } else if (OB_FAIL(conn->start_transaction())) {
-    LOG_WARN("failed to start the ai column worker transaction", K(ret));
   }
   // the metadata: one query, the result is fully consumed before the next statement
   if (OB_SUCC(ret)) {
@@ -2526,6 +2525,37 @@ int ObServer::ObAiColumnWorkerTask::process_once()
     }
     LOG_INFO("ai column worker pending rows", K(ret), K(column.table_id_), K(column.column_id_),
              "row_count", predicates.count());
+    // the typed system prompt follows the result column type
+    ObString data_type;
+    {
+      ObSqlString type_sql;
+      ObISQLClient::ReadResult type_result;
+      if (OB_FAIL(type_sql.append_fmt("select data_type from oceanbase.__all_column "
+                                      "where table_id = %ld and column_name = '%.*s'",
+                                      column.table_id_, column.column_name_.length(),
+                                      column.column_name_.ptr()))) {
+      } else if (OB_FAIL(conn->execute_read(type_sql.string(), type_result))) {
+        LOG_WARN("failed to read the ai result column type", K(ret));
+      } else {
+        sqlclient::ObMySQLResult *type_rows = type_result.get_result();
+        ObString tmp_type;
+        if (NULL != type_rows && OB_SUCCESS == type_rows->next()
+            && OB_SUCCESS == type_rows->get_varchar("data_type", tmp_type)) {
+          (void)ob_write_string(allocator, tmp_type, data_type);
+        }
+      }
+    }
+    ObString system_prompt;
+    if (0 == data_type.case_compare("json")) {
+      system_prompt = ObString::make_string("Return exactly one valid JSON value");
+    } else if (data_type.length() > 3 && 0 == data_type.case_compare("bigint")) {
+      system_prompt = ObString::make_string("Return exactly one base-10 integer");
+    } else if (data_type.length() > 3 && 0 == data_type.case_compare("int")) {
+      system_prompt = ObString::make_string("Return exactly one base-10 integer");
+    } else {
+      system_prompt = column.spec_;
+    }
+    LOG_INFO("ai column worker typed prompt", K(data_type), K(system_prompt));
     for (int64_t j = 0; OB_SUCC(ret) && j < predicates.count(); ++j) {
       const ObString &predicate = predicates.at(j);
       // the prompt of this row
@@ -2570,7 +2600,6 @@ int ObServer::ObAiColumnWorkerTask::process_once()
                                                                            endpoint))) {
       } else {
         ObAIFuncModel model(allocator, *info, endpoint);
-        ObString system_prompt = column.spec_;
         ObString content = prompt;
         call_ret = model.call_completion_with_system(system_prompt, content, NULL, result_str);
         LOG_INFO("ai column worker call done", K(call_ret), K(result_str));
@@ -2605,8 +2634,20 @@ int ObServer::ObAiColumnWorkerTask::process_once()
         LOG_INFO("ai column worker write", K(update_sql), K(call_ret));
         if (OB_ISNULL(obs_)) {
           ret = OB_ERR_UNEXPECTED;
-        } else if (OB_FAIL(obs_->get_mysql_proxy().write(update_sql.string(), affected))) {
-          LOG_WARN("failed to write the ai column result", K(ret), K(call_ret));
+        } else {
+          ObWorkerSessionGuard worker_session_guard(&static_cast<ObInnerSQLConnection *>(conn)->get_session());
+          ret = conn->execute_write(update_sql.string(), affected);
+        }
+        if (OB_SUCC(ret) && affected > 0) {
+          int commit_ret = conn->commit();
+          if (OB_SUCCESS != commit_ret) {
+            LOG_WARN("failed to commit the ai column result", K(commit_ret));
+          }
+        }
+        if (OB_FAIL(ret)) {
+          LOG_WARN("failed to write the ai column result", K(ret), K(call_ret), K(affected));
+        } else if (0 == affected) {
+          LOG_INFO("ai column result write matched no row", K(predicate), K(call_ret));
         } else if (OB_SUCCESS != call_ret) {
           LOG_INFO("ai column request failed", K(column.table_id_), K(predicate), K(call_ret),
                    K(affected));
