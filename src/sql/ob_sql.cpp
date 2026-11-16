@@ -4884,9 +4884,11 @@ int fs_copy(const ObString &stmt, ObIAllocator &alloc, ObString &out, bool &hand
             }
             if (OB_SUCC(ret)) {
               handled = true;
+              // the copy statement must not return a result set: some clients print the
+              // column names of an empty select
               if (OB_FAIL(ob_write_string(alloc,
                                           ObString::make_string(
-                                              "select 1 as `file_sql_copy` where 1 = 0"),
+                                              "set @__file_sql_copy = 1"),
                                           out))) {
                 LOG_WARN("failed to build the copy placeholder", K(ret));
               }
