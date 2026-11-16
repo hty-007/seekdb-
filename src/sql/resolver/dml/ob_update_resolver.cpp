@@ -341,7 +341,26 @@ int ObUpdateResolver::invalidate_ai_columns(ObTableAssignment &table_assign)
             touched = true;
           }
         }
-        if (OB_SUCC(ret) && touched && !user_sets_result) {
+        if (OB_SUCC(ret) && (touched || user_sets_result)) {
+          // an explicit write of the result re-runs the ai expression: keep the
+          // written value, reset the state and clear the stale request marker
+          bool state_assigned = false;
+          bool request_assigned = false;
+          for (int64_t i = 0; OB_SUCC(ret) && i < table_assign.assignments_.count(); ++i) {
+            const ObAssignment &existing = table_assign.assignments_.at(i);
+            if (OB_ISNULL(existing.column_expr_)) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("assignment has no column", K(ret));
+            } else if (existing.column_expr_->get_column_id()
+                       == state_column->get_column_id()) {
+              // the writer already maintains the state column itself
+              state_assigned = true;
+            } else if (existing.column_expr_->get_column_id()
+                       == request_column->get_column_id()) {
+              // the writer already maintains the request column itself
+              request_assigned = true;
+            }
+          }
           ObSEArray<ObColumnRefRawExpr *, 2> result_exprs;
           ObSEArray<ObColumnRefRawExpr *, 2> state_exprs;
           ObSEArray<ObColumnRefRawExpr *, 2> request_exprs;
@@ -376,11 +395,14 @@ int ObUpdateResolver::invalidate_ai_columns(ObTableAssignment &table_assign)
             request_assign.column_expr_ = request_exprs.at(0);
             request_assign.expr_ = null_expr;
             request_assign.is_implicit_ = true;
-            if (OB_FAIL(table_assign.assignments_.push_back(result_assign))) {
+            if (!user_sets_result
+                && OB_FAIL(table_assign.assignments_.push_back(result_assign))) {
               LOG_WARN("failed to invalidate the ai result column", K(ret));
-            } else if (OB_FAIL(table_assign.assignments_.push_back(state_assign))) {
+            } else if (!state_assigned
+                       && OB_FAIL(table_assign.assignments_.push_back(state_assign))) {
               LOG_WARN("failed to reset the ai state column", K(ret));
-            } else if (OB_FAIL(table_assign.assignments_.push_back(request_assign))) {
+            } else if (!request_assigned
+                       && OB_FAIL(table_assign.assignments_.push_back(request_assign))) {
               LOG_WARN("failed to clear the ai request column", K(ret));
             }
           }

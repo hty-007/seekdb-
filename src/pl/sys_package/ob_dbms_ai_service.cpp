@@ -185,6 +185,12 @@ int ObDBMSAiService::drop_ai_model_endpoint(ObPLExecCtx &ctx, sql::ParamStore &p
   } else if (OB_ISNULL(endpoint_admin)) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(endpoint_admin->drop_endpoint(endpoint_name))) {
+    if (OB_AI_FUNC_ENDPOINT_NOT_FOUND == ret) {
+      // dropping an endpoint that is already gone is a no-op, this keeps the
+      // cleanup scripts idempotent
+      LOG_INFO("ai model endpoint does not exist, nothing to drop", K(endpoint_name));
+      ret = OB_SUCCESS;
+    }
   }
 
 

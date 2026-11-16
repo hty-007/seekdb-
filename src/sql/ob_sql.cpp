@@ -38,6 +38,10 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/optimizer/ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
+#include "lib/string/ob_sql_string.h"
+#include "share/ob_server_struct.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "common/mysqlclient/ob_mysql_result.h"
 
 namespace oceanbase
 {
@@ -1927,6 +1931,422 @@ int ObSql::handle_ps_execute(const ObPsStmtId client_stmt_id,
   return ret;
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// ALTER TABLE <tbl> RETRY AI COLUMN <col> [WHERE <pred>]
+//
+// The statement has no dedicated parse rule.  It is rewritten into an ordinary
+// UPDATE before the text reaches the parser, so the regular DML path (result
+// invalidation, asynchronous write back, vector index maintenance) does all the
+// work:
+//   ALTER TABLE t RETRY AI COLUMN c WHERE p  ->  UPDATE t SET `c` = NULL WHERE p'
+// Inside the predicate the retry-only pseudo column STATUS maps to the readiness
+// of the ai column:
+//   status = 'READY'   ->  `c` is not null
+//   status = 'FAILED'  ->  `c` is null
+// A back-ticked `status` keeps addressing the physical column.
+// ---------------------------------------------------------------------------
+
+struct ObAiColumnRetryClause
+{
+  ObString table_;   // table reference as written, e.g. `db`.`tbl`
+  ObString db_;      // unquoted database name, empty when omitted
+  ObString tbl_;     // unquoted table name
+  ObString column_;  // unquoted ai column name
+};
+
+inline bool arc_space(const char c)
+{
+  return isspace(static_cast<unsigned char>(c));
+}
+
+inline bool arc_ident_char(const char c)
+{
+  return isalnum(static_cast<unsigned char>(c)) || '_' == c || '$' == c;
+}
+
+inline void arc_skip_spaces(const ObString &stmt, int64_t &pos)
+{
+  while (pos < stmt.length() && arc_space(stmt.ptr()[pos])) {
+    ++pos;
+  }
+}
+
+// matches one keyword, case insensitively, and moves %pos past it
+bool arc_match_word(const ObString &stmt, int64_t &pos, const char *word)
+{
+  bool matched = false;
+  const int64_t word_len = static_cast<int64_t>(strlen(word));
+  arc_skip_spaces(stmt, pos);
+  if (pos + word_len <= stmt.length()
+      && 0 == ObString(static_cast<int32_t>(word_len), stmt.ptr() + pos).case_compare(word)
+      && (pos + word_len == stmt.length() || !arc_ident_char(stmt.ptr()[pos + word_len]))) {
+    pos += word_len;
+    matched = true;
+  }
+  return matched;
+}
+
+// reads `ident` or ident, returns the raw text and the unquoted name
+bool arc_match_ident(const ObString &stmt, int64_t &pos, ObString &raw, ObString &name)
+{
+  bool matched = false;
+  arc_skip_spaces(stmt, pos);
+  if (pos < stmt.length() && '`' == stmt.ptr()[pos]) {
+    const int64_t begin = pos;
+    const int64_t name_begin = pos + 1;
+    int64_t name_end = -1;
+    ++pos;
+    while (pos < stmt.length()) {
+      if ('`' == stmt.ptr()[pos]) {
+        name_end = pos;
+        ++pos;
+        break;
+      }
+      ++pos;
+    }
+    if (name_end > name_begin) {
+      raw.assign_ptr(stmt.ptr() + begin, static_cast<int32_t>(pos - begin));
+      name.assign_ptr(stmt.ptr() + name_begin,
+                      static_cast<int32_t>(name_end - name_begin));
+      matched = true;
+    }
+  } else {
+    const int64_t begin = pos;
+    while (pos < stmt.length() && arc_ident_char(stmt.ptr()[pos])) {
+      ++pos;
+    }
+    if (pos > begin) {
+      raw.assign_ptr(stmt.ptr() + begin, static_cast<int32_t>(pos - begin));
+      name.assign_ptr(stmt.ptr() + begin, static_cast<int32_t>(pos - begin));
+      matched = true;
+    }
+  }
+  return matched;
+}
+
+// true when nothing but the optional trailing semicolon is left
+bool arc_at_end(const ObString &stmt, int64_t pos)
+{
+  arc_skip_spaces(stmt, pos);
+  if (pos < stmt.length() && ';' == stmt.ptr()[pos]) {
+    ++pos;
+  }
+  arc_skip_spaces(stmt, pos);
+  return pos >= stmt.length();
+}
+
+// A top level comma after the retry clause means another alter action follows,
+// like "retry ai column c where id = 1, add column x int".
+bool arc_has_plain_comma(const ObString &stmt, int64_t begin)
+{
+  bool found = false;
+  int64_t depth = 0;
+  char quote = '\0';
+  for (int64_t i = begin; !found && i < stmt.length(); ++i) {
+    const char c = stmt.ptr()[i];
+    if ('\0' != quote) {
+      if ('\\' == c) {
+        ++i;
+      } else if (c == quote) {
+        quote = '\0';
+      }
+    } else if ('\'' == c || '"' == c || '`' == c) {
+      quote = c;
+    } else if ('(' == c) {
+      ++depth;
+    } else if (')' == c) {
+      if (depth > 0) {
+        --depth;
+      }
+    } else if (',' == c && 0 == depth) {
+      found = true;
+    }
+  }
+  return found;
+}
+
+int arc_append_name(ObSqlString &sql, const ObString &name)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < name.length(); ++i) {
+    if ('\'' == name.ptr()[i] && OB_FAIL(sql.append("''", 2))) {
+      LOG_WARN("failed to escape the name", K(ret));
+    } else if ('\'' != name.ptr()[i] && OB_FAIL(sql.append(name.ptr() + i, 1))) {
+      LOG_WARN("failed to append the name", K(ret));
+    }
+  }
+  return ret;
+}
+
+// an ai result column is user visible, its companion <name>__ai_state column is
+// what marks the column as an ai column
+int arc_check_ai_column(ObSQLSessionInfo &session,
+                        const ObString &db_name,
+                        const ObString &tbl_name,
+                        const ObString &column_name)
+{
+  int ret = OB_SUCCESS;
+  uint64_t database_id = OB_INVALID_ID;
+  bool is_ai_column = false;
+  ObSqlString sql;
+  if (OB_FAIL(session.get_database_id(database_id))) {
+    LOG_WARN("failed to get the session database id", K(ret));
+  } else if (OB_UNLIKELY(db_name.empty() && OB_INVALID_ID == database_id)) {
+    // no database selected, the statement cannot reach an ai column
+  } else if (OB_FAIL(sql.append("select 1 from oceanbase.__all_ai_column c "
+                                "join oceanbase.__all_table t on t.table_id = c.table_id "
+                                "where t.table_name = '"))) {
+    LOG_WARN("failed to build the ai column lookup", K(ret));
+  } else if (OB_FAIL(arc_append_name(sql, tbl_name))) {
+    LOG_WARN("failed to append the table name", K(ret));
+  } else if (OB_FAIL(sql.append("' and c.column_name = '"))) {
+    LOG_WARN("failed to build the ai column lookup", K(ret));
+  } else if (OB_FAIL(arc_append_name(sql, column_name))) {
+    LOG_WARN("failed to append the column name", K(ret));
+  } else if (db_name.empty()
+             && OB_FAIL(sql.append_fmt("' and t.database_id = %lu limit 1",
+                                       static_cast<unsigned long>(database_id)))) {
+    LOG_WARN("failed to build the ai column lookup", K(ret));
+  } else if (!db_name.empty()
+             && OB_FAIL(sql.append_fmt("' and t.database_id in "
+                                       "(select d.database_id from oceanbase.__all_database d "
+                                       "where d.database_name = '%.*s') limit 1",
+                                       db_name.length(), db_name.ptr()))) {
+    LOG_WARN("failed to build the ai column lookup", K(ret));
+  } else {
+    ObISQLClient::ReadResult read_result;
+    if (OB_FAIL(GCTX.sql_proxy_->read(read_result, sql.ptr()))) {
+      LOG_WARN("failed to read the ai columns", K(ret), K(sql));
+    } else if (OB_ISNULL(read_result.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the ai column lookup returned no result", K(ret));
+    } else {
+      const int next_ret = read_result.get_result()->next();
+      if (OB_SUCCESS == next_ret) {
+        is_ai_column = true;
+      } else if (OB_ITER_END != next_ret) {
+        ret = next_ret;
+        LOG_WARN("failed to fetch the ai columns", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !is_ai_column) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+  }
+  return ret;
+}
+
+// rewrites the retry-only pseudo column STATUS into a readiness test
+int arc_translate_predicate(const ObString &predicate,
+                            const ObString &column,
+                            ObIAllocator &allocator,
+                            ObString &translated)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString out;
+  int64_t pos = 0;
+  while (OB_SUCC(ret) && pos < predicate.length()) {
+    const char c = predicate.ptr()[pos];
+    if ('\'' == c || '"' == c) {
+      const int64_t begin = pos;
+      ++pos;
+      while (pos < predicate.length()) {
+        const char inner = predicate.ptr()[pos];
+        if ('\\' == inner) {
+          pos += 2;
+        } else if (inner == c) {
+          ++pos;
+          break;
+        } else {
+          ++pos;
+        }
+      }
+      if (OB_FAIL(out.append(predicate.ptr() + begin, pos - begin))) {
+        LOG_WARN("failed to copy the predicate literal", K(ret));
+      }
+    } else if ('`' == c) {
+      const int64_t begin = pos;
+      ++pos;
+      while (pos < predicate.length() && '`' != predicate.ptr()[pos]) {
+        ++pos;
+      }
+      if (pos < predicate.length()) {
+        ++pos;
+      }
+      if (OB_FAIL(out.append(predicate.ptr() + begin, pos - begin))) {
+        LOG_WARN("failed to copy the quoted identifier", K(ret));
+      }
+    } else if (arc_ident_char(c) && !isdigit(static_cast<unsigned char>(c))) {
+      const int64_t begin = pos;
+      while (pos < predicate.length() && arc_ident_char(predicate.ptr()[pos])) {
+        ++pos;
+      }
+      bool replaced = false;
+      const ObString word(static_cast<int32_t>(pos - begin), predicate.ptr() + begin);
+      if (0 == word.case_compare("status")) {
+        int64_t probe = pos;
+        bool has_operator = false;
+        bool negated = false;
+        arc_skip_spaces(predicate, probe);
+        if (probe < predicate.length() && '=' == predicate.ptr()[probe]) {
+          has_operator = true;
+          ++probe;
+        } else if (probe + 1 < predicate.length() && '!' == predicate.ptr()[probe]
+                   && '=' == predicate.ptr()[probe + 1]) {
+          has_operator = true;
+          negated = true;
+          probe += 2;
+        } else if (probe + 1 < predicate.length() && '<' == predicate.ptr()[probe]
+                   && '>' == predicate.ptr()[probe + 1]) {
+          has_operator = true;
+          negated = true;
+          probe += 2;
+        }
+        if (has_operator) {
+          arc_skip_spaces(predicate, probe);
+          if (probe < predicate.length()
+              && ('\'' == predicate.ptr()[probe] || '"' == predicate.ptr()[probe])) {
+            const char quote = predicate.ptr()[probe];
+            int64_t value_end = probe + 1;
+            while (value_end < predicate.length() && predicate.ptr()[value_end] != quote) {
+              ++value_end;
+            }
+            if (value_end < predicate.length()) {
+              const ObString value(static_cast<int32_t>(value_end - probe - 1),
+                                   predicate.ptr() + probe + 1);
+              const bool is_ready = (0 == value.case_compare("READY"));
+              const bool is_failed = (0 == value.case_compare("FAILED"));
+              if (is_ready || is_failed) {
+                const bool wants_ready = (is_ready != negated);
+                if (wants_ready
+                    && OB_FAIL(out.append_fmt("(`%.*s` is not null)",
+                                              column.length(), column.ptr()))) {
+                  LOG_WARN("failed to append the readiness test", K(ret));
+                } else if (!wants_ready
+                           && OB_FAIL(out.append_fmt("(`%.*s` is null)",
+                                                     column.length(), column.ptr()))) {
+                  LOG_WARN("failed to append the readiness test", K(ret));
+                } else {
+                  pos = value_end + 1;
+                  replaced = true;
+                }
+              }
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !replaced
+          && OB_FAIL(out.append(predicate.ptr() + begin, pos - begin))) {
+        LOG_WARN("failed to copy the predicate identifier", K(ret));
+      }
+    } else {
+      if (OB_FAIL(out.append(predicate.ptr() + pos, 1))) {
+        LOG_WARN("failed to copy the predicate", K(ret));
+      }
+      ++pos;
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ob_write_string(allocator, out.string(), translated))) {
+    LOG_WARN("failed to keep the translated predicate", K(ret));
+  }
+  return ret;
+}
+
+// Rewrites the statement into an UPDATE. %rewritten stays empty when the text is
+// not an AI COLUMN RETRY statement, so the parser reports the syntax error.
+int arc_rewrite_retry(const ObString &stmt,
+                      ObIAllocator &allocator,
+                      ObSQLSessionInfo &session,
+                      ObString &rewritten)
+{
+  int ret = OB_SUCCESS;
+  ObAiColumnRetryClause clause;
+  ObString raw;
+  ObString name;
+  ObString predicate;
+  bool has_predicate = false;
+  bool matched = false;
+  int64_t pos = 0;
+  rewritten.reset();
+  if (!arc_match_word(stmt, pos, "alter") || !arc_match_word(stmt, pos, "table")) {
+    // not a retry statement
+  } else {
+    arc_skip_spaces(stmt, pos);
+    const int64_t ref_begin = pos;
+    if (!arc_match_ident(stmt, pos, raw, name)) {
+      matched = false;
+    } else if (pos < stmt.length() && '.' == stmt.ptr()[pos]) {
+      ++pos;
+      clause.db_ = name;
+      matched = arc_match_ident(stmt, pos, raw, clause.tbl_);
+    } else {
+      clause.tbl_ = name;
+      matched = true;
+    }
+    if (matched) {
+      clause.table_.assign_ptr(stmt.ptr() + ref_begin,
+                               static_cast<int32_t>(pos - ref_begin));
+      matched = arc_match_word(stmt, pos, "retry")
+                && arc_match_word(stmt, pos, "ai")
+                && arc_match_word(stmt, pos, "column")
+                && arc_match_ident(stmt, pos, raw, clause.column_);
+    }
+  }
+  if (matched) {
+    arc_skip_spaces(stmt, pos);
+    if (arc_match_word(stmt, pos, "where")) {
+      int64_t pred_end = stmt.length();
+      while (pred_end > pos
+             && (arc_space(stmt.ptr()[pred_end - 1]) || ';' == stmt.ptr()[pred_end - 1])) {
+        --pred_end;
+      }
+      if (pred_end <= pos) {
+        // "where" without a predicate: let the parser report it
+        matched = false;
+      } else {
+        predicate.assign_ptr(stmt.ptr() + pos, static_cast<int32_t>(pred_end - pos));
+        has_predicate = true;
+      }
+    }
+    if (matched && arc_has_plain_comma(stmt, pos)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+    } else if (matched && !has_predicate && !arc_at_end(stmt, pos)) {
+      // something else follows the column, leave it to the parser
+      matched = false;
+    }
+  }
+  if (OB_SUCC(ret) && matched) {
+    ObString translated;
+    if (OB_FAIL(arc_check_ai_column(session, clause.db_, clause.tbl_, clause.column_))) {
+      LOG_WARN("failed to check the retried column", K(ret), K(clause.tbl_),
+               K(clause.column_));
+    } else if (OB_FAIL(arc_translate_predicate(predicate, clause.column_,
+                                               allocator, translated))) {
+      LOG_WARN("failed to translate the retry predicate", K(ret));
+    } else {
+      ObSqlString sql;
+      if (OB_FAIL(sql.append_fmt("update %.*s set `%.*s` = null",
+                                 clause.table_.length(), clause.table_.ptr(),
+                                 clause.column_.length(), clause.column_.ptr()))) {
+        LOG_WARN("failed to build the retry update", K(ret));
+      } else if (has_predicate
+                 && OB_FAIL(sql.append_fmt(" where %.*s",
+                                           translated.length(), translated.ptr()))) {
+        LOG_WARN("failed to build the retry predicate", K(ret));
+      } else if (OB_FAIL(ob_write_string(allocator, sql.string(), rewritten))) {
+        LOG_WARN("failed to keep the rewritten statement", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+}  // namespace
+
 OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, ObResultSet &result)
 {
   int ret = OB_SUCCESS;
@@ -1944,6 +2364,20 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
 
   ObIAllocator &allocator = THIS_WORKER.get_sql_arena_allocator();
   ObSQLSessionInfo &session = result.get_session();
+  if (OB_SUCC(ret)) {
+    // ALTER TABLE ... RETRY AI COLUMN ... is rewritten into an UPDATE before the
+    // statement is parsed, so the regular dml path does the work
+    ObString rewritten;
+    if (OB_FAIL(arc_rewrite_retry(trimed_stmt, allocator, session, rewritten))) {
+      LOG_WARN("failed to rewrite the ai column retry statement", K(ret));
+      if (OB_NOT_SUPPORTED == ret) {
+        // a rejected retry statement is a user error: keep the session alive
+        result.get_exec_context().set_need_disconnect(false);
+      }
+    } else if (!rewritten.empty()) {
+      trimed_stmt = rewritten;
+    }
+  }
   
   ObExecContext& ectx = result.get_exec_context();
   int get_plan_err = OB_SUCCESS; //used for judge whether add plan to plan cache

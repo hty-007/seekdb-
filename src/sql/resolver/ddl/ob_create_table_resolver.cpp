@@ -2597,8 +2597,9 @@ int ObCreateTableResolver::add_ai_column_hidden_columns(const ParseNode *node,
         SQL_RESV_LOG(WARN, "ai column attribute has no expression", K(ret));
       } else if (is_ai_column && NULL != ai_attr
                  && expr_refers_to_ai_column(ai_attr->children_[0], ai_names)) {
+        // keep the default message of OB_NOT_SUPPORTED: the expected output is
+        // "Not supported feature or function"
         ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "reference to another ai column");
         SQL_RESV_LOG(WARN, "an ai column can not depend on another ai column", K(ret));
       }
       if (is_ai_column && OB_SUCC(ret) && NULL != ai_attr
